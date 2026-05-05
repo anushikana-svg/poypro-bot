@@ -236,8 +236,11 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        amount_text = update.message.text.strip()
+        # Принимаем и точку и запятую, сохраняем с запятой
+        amount_text = update.message.text.strip().replace('.', ',')
         amount = float(amount_text.replace(',', '.'))
+        if amount <= 0:
+            raise ValueError
         context.user_data['amount'] = amount
         context.user_data['amount_text'] = amount_text
         await update.message.reply_text(
@@ -248,7 +251,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return DESCRIPTION
     except ValueError:
         await update.message.reply_text(
-            "❌ Неверный формат. Введите сумму в формате <b>1883,75</b>:",
+            "❌ Неверный формат. Введите сумму числом, например <b>1883,75</b> или <b>1883</b>:",
             parse_mode=ParseMode.HTML
         )
         return AMOUNT
