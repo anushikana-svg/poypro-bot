@@ -35,7 +35,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Состояния диалога
 (MENU, DIRECTION, SUBTYPE, SUBPROJECT, GASTROL_CHOOSE, GASTROL_DATE,
  GASTROL_YEAR, GASTROL_CITY, CATEGORY, AMOUNT, DESCRIPTION,
  RECEIPT, CONFIRM, EDIT_CHOICE) = range(14)
@@ -89,25 +88,19 @@ def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> O
         if not upload_url:
             return None
         requests.put(upload_url, data=file_bytes)
-
-        # Публикуем файл
         requests.put(
             "https://cloud-api.yandex.net/v1/disk/resources/publish",
             headers={"Authorization": f"OAuth {token}"},
             params={"path": disk_path}
         )
-
-        # Получаем прямую ссылку на скачивание для IMAGE()
         download_resp = requests.get(
             "https://cloud-api.yandex.net/v1/disk/resources/download",
             headers={"Authorization": f"OAuth {token}"},
             params={"path": disk_path}
         )
-        direct_url = download_resp.json().get("href")
-        return direct_url
-
+        return download_resp.json().get("href")
     except Exception as e:
-        logger.error(f"Ошибка загрузки на Яндекс Диск: {e}")
+        logger.error(f"Яндекс Диск ошибка: {e}")
         return None
 
 
@@ -141,61 +134,56 @@ class GoogleSheetsManager:
                 sheet = self.spreadsheet.add_worksheet(
                     title=user_name, rows=1000, cols=15
                 )
-                # Заголовки
-                sheet.append_row(SHEET_HEADERS)
-
-                # Жирный заголовок
+                # Заголовки в A1:I1
+                sheet.update('A1:I1', [SHEET_HEADERS])
                 sheet.format('A1:I1', {
                     'textFormat': {'bold': True},
                     'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
                 })
 
-                # Флажки в G и H
-                requests_body = {
-                    "requests": [
-                        {
-                            "repeatCell": {
-                                "range": {
-                                    "sheetId": sheet.id,
-                                    "startRowIndex": 1,
-                                    "endRowIndex": 1000,
-                                    "startColumnIndex": 6,
-                                    "endColumnIndex": 8
-                                },
-                                "cell": {
-                                    "dataValidation": {
-                                        "condition": {"type": "BOOLEAN"},
-                                        "strict": True
-                                    }
-                                },
-                                "fields": "dataValidation"
-                            }
+                # Флажки в G2:H1000
+                self.spreadsheet.batch_update({
+                    "requests": [{
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet.id,
+                                "startRowIndex": 1,
+                                "endRowIndex": 1000,
+                                "startColumnIndex": 6,
+                                "endColumnIndex": 8
+                            },
+                            "cell": {
+                                "dataValidation": {
+                                    "condition": {"type": "BOOLEAN"},
+                                    "strict": True
+                                }
+                            },
+                            "fields": "dataValidation"
                         }
-                    ]
-                }
-                self.spreadsheet.batch_update(requests_body)
+                    }]
+                })
 
-                # Формулы баланса справа
+                # Баланс в K1:L8
                 balance_data = [
                     ['Баланс', ''],
                     ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
                     ['Принято расходов', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000=TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
                     ['Ожидает проверки', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000<>TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
                     ['Компенсировано', '=SUMPRODUCT((A2:A1000="Компенсация")*(H2:H1000<>TRUE)*C2:C1000)'],
-                    ['Остаток', '=K3-K4-K6'],
-                    ['Реально на руках', '=K3-K4-K5-K6'],
+                    ['Остаток', '=L3-L4-L6'],
+                    ['Реально на руках', '=L3-L4-L5-L6'],
                 ]
-                for i, (label, formula) in enumerate(balance_data):
-                    row = i + 1
-                    sheet.update_cell(row, 11, label)
-                    if formula:
-                        sheet.update_cell(row, 12, formula)
-
+                sheet.update('K1:L7', balance_data, value_input_option='USER_ENTERED')
                 logger.info(f"Создан лист для {user_name}")
                 return sheet
         except Exception as e:
             logger.error(f"Ошибка листа: {e}")
             return None
+
+    def _next_empty_row(self, sheet) -> int:
+        """Найти первую пустую строку в колонке A начиная со строки 2"""
+        col_a = sheet.col_values(1)
+        return len(col_a) + 1
 
     def get_subprojects(self, direction: str, ptype: str) -> List[str]:
         try:
@@ -207,7 +195,7 @@ class GoogleSheetsManager:
                 and row[1].strip() == ptype
             ]
         except Exception as e:
-            logger.error(f"Ошибка справочника: {e}")
+            logger.error(f"Справочник ошибка: {e}")
             return []
 
     def add_expense(self, user_name: str, data: Dict) -> bool:
@@ -217,12 +205,12 @@ class GoogleSheetsManager:
                 return False
 
             receipt_url = data.get('receipt_url', '')
-            if receipt_url and ('yandex' in receipt_url or 'yadi.sk' in receipt_url):
+            if receipt_url and 'yandex' in receipt_url:
                 receipt_cell = f'=IMAGE("{receipt_url}")'
             else:
                 receipt_cell = receipt_url
 
-            row = [
+            row_data = [
                 'Расход',
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
                 data.get('amount', ''),
@@ -233,7 +221,14 @@ class GoogleSheetsManager:
                 False,
                 receipt_cell,
             ]
-            sheet.append_row(row)
+
+            # Записываем в первую пустую строку колонки A
+            next_row = self._next_empty_row(sheet)
+            sheet.update(
+                f'A{next_row}:I{next_row}',
+                [row_data],
+                value_input_option='USER_ENTERED'
+            )
             return True
         except Exception as e:
             logger.error(f"Ошибка добавления: {e}")
@@ -296,7 +291,7 @@ class GoogleSheetsManager:
                 'real_balance': issued - accepted - pending - compensated,
             }
         except Exception as e:
-            logger.error(f"Ошибка баланса: {e}")
+            logger.error(f"Баланс ошибка: {e}")
             return self._empty_balance()
 
     def _empty_balance(self):
@@ -820,7 +815,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             parse_mode=ParseMode.HTML
                         )
                 except Exception as e:
-                    logger.error(f"Ошибка уведомления: {e}")
+                    logger.error(f"Уведомление ошибка: {e}")
         else:
             await query.edit_message_text("❌ Ошибка при сохранении. Попробуйте ещё раз.")
 
