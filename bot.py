@@ -5,7 +5,6 @@ Expense Tracker Bot для Telegram
 """
 
 import os
-import io
 import logging
 import requests
 from datetime import datetime
@@ -24,6 +23,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 import gspread
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 import json
 
@@ -59,31 +59,27 @@ CATEGORIES = [
 ]
 
 CAT_CODES = {f'cat_{i}': cat for i, cat in enumerate(CATEGORIES)}
-CAT_REVERSE = {cat: f'cat_{i}' for i, cat in enumerate(CATEGORIES)}
+
+SHEET_HEADERS = [
+    'Тип', 'Дата', 'Сумма', 'Подпроект',
+    'Категория', 'Описание', 'Расход принят', 'Закрыто', 'Чек'
+]
 
 
 def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
-    """Загрузить файл на Яндекс Диск и вернуть публичную ссылку"""
     token = os.getenv('YANDEX_DISK_TOKEN')
     if not token:
-        logger.warning("YANDEX_DISK_TOKEN не задан")
         return None
     try:
         now = datetime.now()
         folder = f"Чеки/{user_name}/{now.year}/{now.month:02d}"
-        # Создаём папки
-        for path in [
-            "Чеки",
-            f"Чеки/{user_name}",
-            f"Чеки/{user_name}/{now.year}",
-            folder
-        ]:
+        for path in ["Чеки", f"Чеки/{user_name}",
+                     f"Чеки/{user_name}/{now.year}", folder]:
             requests.put(
                 "https://cloud-api.yandex.net/v1/disk/resources",
                 headers={"Authorization": f"OAuth {token}"},
                 params={"path": path}
             )
-        # Получаем URL для загрузки
         disk_path = f"{folder}/{filename}"
         resp = requests.get(
             "https://cloud-api.yandex.net/v1/disk/resources/upload",
@@ -93,15 +89,12 @@ def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> O
         upload_url = resp.json().get("href")
         if not upload_url:
             return None
-        # Загружаем файл
         requests.put(upload_url, data=file_bytes)
-        # Публикуем
         requests.put(
             "https://cloud-api.yandex.net/v1/disk/resources/publish",
             headers={"Authorization": f"OAuth {token}"},
             params={"path": disk_path}
         )
-        # Получаем публичную ссылку
         meta = requests.get(
             "https://cloud-api.yandex.net/v1/disk/resources",
             headers={"Authorization": f"OAuth {token}"},
@@ -123,7 +116,6 @@ class GoogleSheetsManager:
             creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
             sheets_id = os.getenv('GOOGLE_SHEETS_ID')
             if not creds_json or not sheets_id:
-                logger.warning("Не заданы GOOGLE_CREDENTIALS_JSON или GOOGLE_SHEETS_ID")
                 return
             creds_data = json.loads(creds_json)
             creds = Credentials.from_service_account_info(
@@ -132,162 +124,192 @@ class GoogleSheetsManager:
             )
             client = gspread.authorize(creds)
             self.spreadsheet = client.open_by_key(sheets_id)
-            logger.info("Google Sheets подключен успешно")
+            logger.info("Google Sheets подключен")
         except Exception as e:
-            logger.error(f"Ошибка подключения к Google Sheets: {e}")
+            logger.error(f"Ошибка подключения: {e}")
 
-    def get_sheet(self, name: str):
+    def get_or_create_employee_sheet(self, user_name: str):
+        """Получить или создать лист сотрудника"""
         try:
-            return self.spreadsheet.worksheet(name)
+            try:
+                sheet = self.spreadsheet.worksheet(user_name)
+                return sheet
+            except WorksheetNotFound:
+                # Создаём новый лист
+                sheet = self.spreadsheet.add_worksheet(
+                    title=user_name, rows=1000, cols=15
+                )
+                # Заголовки
+                sheet.append_row(SHEET_HEADERS)
+
+                # Форматируем заголовок
+                sheet.format('A1:I1', {
+                    'textFormat': {'bold': True},
+                    'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
+                })
+
+                # Добавляем флажки в G и H
+                sheet.format('G2:H1000', {
+                    'dataValidation': {
+                        'condition': {'type': 'BOOLEAN'},
+                        'strict': True
+                    }
+                })
+
+                # Заголовки баланса справа
+                balance_labels = [
+                    ['Баланс', ''],
+                    ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['Принято расходов', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000=TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['Ожидает проверки', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000<>TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['Компенсировано', '=SUMPRODUCT((A2:A1000="Компенсация")*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['Остаток', '=K3-K4-K6'],
+                    ['Реально на руках', '=K3-K4-K5-K6'],
+                ]
+                for i, (label, formula) in enumerate(balance_labels):
+                    row = i + 1
+                    sheet.update_cell(row, 11, label)
+                    if formula:
+                        sheet.update_cell(row, 12, formula)
+
+                logger.info(f"Создан лист для {user_name}")
+                return sheet
         except Exception as e:
-            logger.error(f"Ошибка получения листа {name}: {e}")
+            logger.error(f"Ошибка получения/создания листа: {e}")
             return None
 
     def get_subprojects(self, direction: str, ptype: str) -> List[str]:
-        """Получить список из справочника"""
         try:
-            sheet = self.get_sheet('Справочники')
-            if not sheet:
-                return []
+            sheet = self.spreadsheet.worksheet('Справочники')
             rows = sheet.get_all_values()
-            result = []
-            for row in rows[1:]:
-                if len(row) >= 3 and row[0].strip() == direction and row[1].strip() == ptype:
-                    result.append(row[2].strip())
-            return result
+            return [
+                row[2].strip() for row in rows[1:]
+                if len(row) >= 3 and row[0].strip() == direction
+                and row[1].strip() == ptype
+            ]
         except Exception as e:
-            logger.error(f"Ошибка получения справочника: {e}")
+            logger.error(f"Ошибка справочника: {e}")
             return []
 
-    def add_expense(self, data: Dict) -> bool:
+    def add_expense(self, user_name: str, data: Dict) -> bool:
         try:
-            sheet = self.get_sheet('Расходы')
+            sheet = self.get_or_create_employee_sheet(user_name)
             if not sheet:
                 return False
+
+            # Формируем ссылку на чек
+            receipt_url = data.get('receipt_url', '')
+            if receipt_url and receipt_url.startswith('https://disk.yandex'):
+                receipt_cell = f'=IMAGE("{receipt_url}")'
+            else:
+                receipt_cell = receipt_url
+
             row = [
+                'Расход',
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
-                data.get('user_name', ''),
-                data.get('project', ''),
+                data.get('amount', ''),
                 data.get('subproject', ''),
                 data.get('category', ''),
-                data.get('amount', ''),
                 data.get('description', ''),
-                data.get('receipt_url', ''),
-                'Не принят',
-                'Нет',
+                False,  # Расход принят
+                False,  # Закрыто
+                receipt_cell,
             ]
             sheet.append_row(row)
             return True
         except Exception as e:
-            logger.error(f"Ошибка при добавлении расхода: {e}")
+            logger.error(f"Ошибка добавления расхода: {e}")
             return False
 
-    def check_duplicate(self, user_name: str, project: str, subproject: str,
+    def check_duplicate(self, user_name: str, subproject: str,
                         category: str, amount: str) -> bool:
         try:
-            sheet = self.get_sheet('Расходы')
+            sheet = self.get_or_create_employee_sheet(user_name)
             if not sheet:
                 return False
             rows = sheet.get_all_values()
             for row in rows[1:]:
                 if len(row) >= 6:
-                    if (row[1] == user_name and row[2] == project and
-                            row[3] == subproject and row[4] == category and
-                            row[5] == amount):
+                    if (row[3] == subproject and row[4] == category
+                            and str(row[2]) == amount):
                         return True
             return False
         except Exception as e:
-            logger.error(f"Ошибка проверки дубликата: {e}")
+            logger.error(f"Ошибка дубликата: {e}")
             return False
 
     def get_balance(self, user_name: str) -> Dict:
         try:
-            # Выдано
+            sheet = self.get_or_create_employee_sheet(user_name)
+            if not sheet:
+                return self._empty_balance()
+            rows = sheet.get_all_values()
+
             issued = 0.0
-            sheet_v = self.get_sheet('Выдано')
-            if sheet_v:
-                rows = sheet_v.get_all_values()
-                for row in rows[1:]:
-                    if len(row) >= 4 and row[1] == user_name and row[3] == 'Нет':
-                        try:
-                            issued += float(str(row[2]).replace(' ', '').replace(',', '.'))
-                        except:
-                            pass
-
-            # Принятые расходы
             accepted = 0.0
-            # Ожидающие расходы
             pending = 0.0
-            sheet_r = self.get_sheet('Расходы')
-            if sheet_r:
-                rows = sheet_r.get_all_values()
-                for row in rows[1:]:
-                    if len(row) >= 10 and row[1] == user_name and row[9] == 'Нет':
-                        try:
-                            amount = float(str(row[5]).replace(' ', '').replace(',', '.'))
-                            if row[8] == 'Принят':
-                                accepted += amount
-                            elif row[8] == 'Не принят':
-                                pending += amount
-                        except:
-                            pass
+            compensated = 0.0
 
-            # Компенсации
-            compensations = []
-            sheet_k = self.get_sheet('Компенсации')
-            if sheet_k:
-                rows = sheet_k.get_all_values()
-                for row in rows[1:]:
-                    if len(row) >= 5 and row[1] == user_name and row[4] == 'Нет':
-                        try:
-                            amount = float(str(row[2]).replace(' ', '').replace(',', '.'))
-                            compensations.append({
-                                'amount': amount,
-                                'date': row[0],
-                                'comment': row[3] if len(row) > 3 else ''
-                            })
-                        except:
-                            pass
+            for row in rows[1:]:
+                if len(row) < 8 or not row[0]:
+                    continue
+                try:
+                    amount = float(str(row[2]).replace(' ', '').replace(',', '.'))
+                except:
+                    continue
 
-            total_compensated = sum(c['amount'] for c in compensations)
-            balance = issued - accepted - total_compensated
-            real_balance = issued - accepted - pending - total_compensated
+                closed = str(row[7]).upper() in ('TRUE', 'ИСТИНА', '1')
+                if closed:
+                    continue
+
+                accepted_flag = str(row[6]).upper() in ('TRUE', 'ИСТИНА', '1')
+                rtype = row[0].strip()
+
+                if rtype == 'Выдано':
+                    issued += amount
+                elif rtype == 'Расход':
+                    if accepted_flag:
+                        accepted += amount
+                    else:
+                        pending += amount
+                elif rtype == 'Компенсация':
+                    compensated += amount
 
             return {
                 'issued': issued,
                 'accepted': accepted,
                 'pending': pending,
-                'compensated': total_compensated,
-                'compensations': compensations,
-                'balance': balance,
-                'real_balance': real_balance,
+                'compensated': compensated,
+                'balance': issued - accepted - compensated,
+                'real_balance': issued - accepted - pending - compensated,
             }
         except Exception as e:
-            logger.error(f"Ошибка расчёта баланса: {e}")
-            return {
-                'issued': 0, 'accepted': 0, 'pending': 0,
-                'compensated': 0, 'compensations': [],
-                'balance': 0, 'real_balance': 0
-            }
+            logger.error(f"Ошибка баланса: {e}")
+            return self._empty_balance()
+
+    def _empty_balance(self):
+        return {'issued': 0, 'accepted': 0, 'pending': 0,
+                'compensated': 0, 'balance': 0, 'real_balance': 0}
 
     def get_my_expenses(self, user_name: str) -> List[Dict]:
         try:
-            sheet = self.get_sheet('Расходы')
+            sheet = self.get_or_create_employee_sheet(user_name)
             if not sheet:
                 return []
             rows = sheet.get_all_values()
             result = []
             for row in rows[1:]:
-                if len(row) >= 9 and row[1] == user_name:
+                if len(row) >= 6 and row[0] == 'Расход':
+                    accepted = str(row[6]).upper() in ('TRUE', 'ИСТИНА', '1') if len(row) > 6 else False
                     result.append({
-                        'date': row[0],
-                        'amount': row[5],
+                        'date': row[1],
+                        'amount': row[2],
                         'category': row[4],
-                        'status': row[8],
+                        'status': '✅ Принят' if accepted else '⏳ Ожидает',
                     })
             return result[-20:]
         except Exception as e:
-            logger.error(f"Ошибка получения расходов: {e}")
+            logger.error(f"Ошибка расходов: {e}")
             return []
 
 
@@ -320,8 +342,7 @@ def format_amount(text: str) -> Optional[str]:
             return None
         if value == int(value):
             return str(int(value))
-        else:
-            return f"{value:.2f}".replace('.', ',')
+        return f"{value:.2f}".replace('.', ',')
     except:
         return None
 
@@ -335,18 +356,11 @@ def main_menu_keyboard():
 
 
 def format_balance(b: Dict) -> str:
-    text = f"💰 <b>Ваш баланс</b>\n\n"
+    text = "💰 <b>Ваш баланс</b>\n\n"
     text += f"Выдано: <b>{b['issued']:,.2f} ₽</b>\n"
-
-    if b['compensations']:
-        for c in b['compensations']:
-            text += f"💸 Погашен перерасход: <b>−{c['amount']:,.2f} ₽</b>"
-            if c['date']:
-                text += f" ({c['date']})"
-            text += "\n"
-
     text += f"\n✅ Принято расходов: <b>{b['accepted']:,.2f} ₽</b>\n"
     text += f"⏳ Ожидает проверки: <b>{b['pending']:,.2f} ₽</b>\n"
+    text += f"💸 Компенсировано: <b>{b['compensated']:,.2f} ₽</b>\n"
     text += f"─────────────────\n"
     text += f"Остаток (принятые): <b>{b['balance']:,.2f} ₽</b>\n"
     text += f"Реально на руках: <b>{b['real_balance']:,.2f} ₽</b>"
@@ -397,9 +411,9 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines = ["📋 <b>Мои расходы (последние 20)</b>\n"]
             for e in expenses:
-                status_emoji = "✅" if e['status'] == 'Принят' else "⏳"
                 lines.append(
-                    f"{status_emoji} {e['date'][:10]} | {e['amount']} ₽ | {e['category']}")
+                    f"{e['status']} {e['date'][:10]} | {e['amount']} ₽ | {e['category']}"
+                )
             text = "\n".join(lines)
         await query.edit_message_text(
             text,
@@ -443,7 +457,6 @@ async def subtype_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     code = context.user_data['direction_code']
 
     if subtype == 'Гастроль':
-        # Получаем гастроли из справочника
         gs = GoogleSheetsManager()
         gastrol_list = gs.get_subprojects(code, 'Гастроль')
         if gastrol_list:
@@ -497,7 +510,6 @@ async def gastrol_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if query.data == '➕ Другая дата':
         await query.edit_message_text(
-            f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n\n"
             "📅 Введите дату в формате <b>ДД.ММ</b>:",
             parse_mode=ParseMode.HTML
         )
@@ -505,7 +517,6 @@ async def gastrol_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         context.user_data['subproject'] = f"Гастроль — {query.data}"
         await query.edit_message_text(
-            f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n"
             f"✅ Подпроект: <b>{context.user_data['subproject']}</b>\n\n"
             "🏷 Выберите категорию:",
             reply_markup=make_category_keyboard(),
@@ -519,25 +530,22 @@ async def gastrol_date_received(update: Update, context: ContextTypes.DEFAULT_TY
     parts = text.split('.')
     if len(parts) != 2 or not all(p.isdigit() for p in parts):
         await update.message.reply_text(
-            "❌ Неверный формат. Введите дату в формате <b>ДД.ММ</b>, например <b>15.06</b>:",
+            "❌ Неверный формат. Введите дату <b>ДД.ММ</b>, например <b>15.06</b>:",
             parse_mode=ParseMode.HTML
         )
         return GASTROL_DATE
 
     context.user_data['gastrol_date'] = text
-    month = int(parts[1])
+    current_month = datetime.now().month
 
-    # С октября предлагаем выбор года
-    if month >= 10:
+    if current_month >= 10:
         current_year = datetime.now().year
-        next_year = current_year + 1
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(str(current_year), callback_data=f"year_{current_year}"),
-            InlineKeyboardButton(str(next_year), callback_data=f"year_{next_year}"),
+            InlineKeyboardButton(str(current_year + 1), callback_data=f"year_{current_year + 1}"),
         ]])
         await update.message.reply_text(
-            f"✅ Дата: <b>{text}</b>\n\n"
-            "📅 Выберите год:",
+            f"✅ Дата: <b>{text}</b>\n\n📅 Выберите год:",
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
@@ -546,7 +554,7 @@ async def gastrol_date_received(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['gastrol_year'] = datetime.now().year
         await update.message.reply_text(
             f"✅ Дата: <b>{text}.{datetime.now().year}</b>\n\n"
-            "🏙 Введите город или площадку (или <b>-</b> чтобы пропустить):",
+            "🏙 Введите город (или <b>-</b> чтобы пропустить):",
             parse_mode=ParseMode.HTML
         )
         return GASTROL_CITY
@@ -560,7 +568,7 @@ async def gastrol_year_selected(update: Update, context: ContextTypes.DEFAULT_TY
     date = context.user_data['gastrol_date']
     await query.edit_message_text(
         f"✅ Дата: <b>{date}.{year}</b>\n\n"
-        "🏙 Введите город или площадку (или <b>-</b> чтобы пропустить):",
+        "🏙 Введите город (или <b>-</b> чтобы пропустить):",
         parse_mode=ParseMode.HTML
     )
     return GASTROL_CITY
@@ -576,8 +584,11 @@ async def gastrol_city_received(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         context.user_data['subproject'] = f"Гастроль — {date}.{year}, {text}"
 
+    if context.user_data.get('editing'):
+        context.user_data.pop('editing')
+        return await show_confirm_msg(update.message, context)
+
     await update.message.reply_text(
-        f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n"
         f"✅ Подпроект: <b>{context.user_data['subproject']}</b>\n\n"
         "🏷 Выберите категорию:",
         reply_markup=make_category_keyboard(),
@@ -590,8 +601,12 @@ async def subproject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     context.user_data['subproject'] = query.data
+
+    if context.user_data.get('editing'):
+        context.user_data.pop('editing')
+        return await show_confirm_edit(query, context)
+
     await query.edit_message_text(
-        f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n"
         f"✅ Подпроект: <b>{query.data}</b>\n\n"
         "🏷 Выберите категорию:",
         reply_markup=make_category_keyboard(),
@@ -611,8 +626,6 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await show_confirm_edit(query, context)
 
     await query.edit_message_text(
-        f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n"
-        f"✅ Подпроект: <b>{context.user_data['subproject']}</b>\n"
         f"✅ Категория: <b>{cat_name}</b>\n\n"
         "💰 Введите сумму (например <b>1883,75</b> или <b>1883</b>):",
         parse_mode=ParseMode.HTML
@@ -624,7 +637,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     amount_str = format_amount(update.message.text)
     if not amount_str:
         await update.message.reply_text(
-            "❌ Неверный формат. Введите сумму числом, например <b>1883,75</b> или <b>1883</b>:",
+            "❌ Неверный формат. Введите сумму, например <b>1883,75</b> или <b>1883</b>:",
             parse_mode=ParseMode.HTML
         )
         return AMOUNT
@@ -663,14 +676,13 @@ async def description_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message.photo:
-        await update.message.reply_text("❌ Нужно отправить фото чека. Сфотографируйте чек и отправьте:")
+        await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
-
-    # Загружаем на Яндекс Диск
     user_name = full_name(update.effective_user)
+
     file_bytes = await file.download_as_bytearray()
     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
     yandex_url = upload_to_yandex_disk(bytes(file_bytes), filename, user_name)
@@ -679,68 +691,53 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data['receipt_file_id'] = photo.file_id
     context.user_data['receipt_on_yandex'] = yandex_url is not None
 
-    if context.user_data.get('editing'):
-        context.user_data.pop('editing')
-        return await show_confirm_msg(update.message, context)
-
     return await show_confirm_msg(update.message, context)
 
 
-async def show_confirm_msg(message, context):
-    """Показать экран подтверждения через message"""
-    gs = GoogleSheetsManager()
-    d = context.user_data
-    is_dup = gs.check_duplicate(
-        d.get('user_name', ''),
-        d['direction_name'],
-        d['subproject'],
-        d['category'],
-        d['amount']
-    )
-    dup_warning = "\n\n⚠️ <b>Внимание: похожий расход уже существует!</b>" if is_dup else ""
+def get_confirm_text(d: Dict) -> str:
     receipt_status = "✅ Чек на Яндекс Диске" if d.get('receipt_on_yandex') else "✅ Чек загружен"
+    return (
+        f"📋 <b>Проверьте данные:</b>\n\n"
+        f"🏗 Направление: <b>{d.get('direction_name', '')}</b>\n"
+        f"📌 Подпроект: <b>{d.get('subproject', '')}</b>\n"
+        f"🏷 Категория: <b>{d.get('category', '')}</b>\n"
+        f"💰 Сумма: <b>{d.get('amount', '')} ₽</b>\n"
+        f"📝 Описание: <b>{d.get('description', '')}</b>\n"
+        f"{receipt_status}"
+    )
 
-    keyboard = InlineKeyboardMarkup([
+
+def confirm_keyboard():
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_yes"),
             InlineKeyboardButton("✏️ Изменить", callback_data="confirm_edit"),
         ],
         [InlineKeyboardButton("❌ Отмена", callback_data="confirm_no")],
     ])
+
+
+async def show_confirm_msg(message, context):
+    d = context.user_data
+    gs = GoogleSheetsManager()
+    user_name = d.get('user_name', '')
+    is_dup = gs.check_duplicate(
+        user_name, d.get('subproject', ''),
+        d.get('category', ''), d.get('amount', '')
+    )
+    dup_warning = "\n\n⚠️ <b>Похожий расход уже существует!</b>" if is_dup else ""
     await message.reply_text(
-        f"📋 <b>Проверьте данные:</b>{dup_warning}\n\n"
-        f"🏗 Направление: <b>{d['direction_name']}</b>\n"
-        f"📌 Подпроект: <b>{d['subproject']}</b>\n"
-        f"🏷 Категория: <b>{d['category']}</b>\n"
-        f"💰 Сумма: <b>{d['amount']} ₽</b>\n"
-        f"📝 Описание: <b>{d['description']}</b>\n"
-        f"{receipt_status}",
-        reply_markup=keyboard,
+        get_confirm_text(d) + dup_warning,
+        reply_markup=confirm_keyboard(),
         parse_mode=ParseMode.HTML
     )
     return CONFIRM
 
 
 async def show_confirm_edit(query, context):
-    """Показать экран подтверждения через query"""
-    d = context.user_data
-    receipt_status = "✅ Чек на Яндекс Диске" if d.get('receipt_on_yandex') else "✅ Чек загружен"
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_yes"),
-            InlineKeyboardButton("✏️ Изменить", callback_data="confirm_edit"),
-        ],
-        [InlineKeyboardButton("❌ Отмена", callback_data="confirm_no")],
-    ])
     await query.edit_message_text(
-        f"📋 <b>Проверьте данные:</b>\n\n"
-        f"🏗 Направление: <b>{d['direction_name']}</b>\n"
-        f"📌 Подпроект: <b>{d['subproject']}</b>\n"
-        f"🏷 Категория: <b>{d['category']}</b>\n"
-        f"💰 Сумма: <b>{d['amount']} ₽</b>\n"
-        f"📝 Описание: <b>{d['description']}</b>\n"
-        f"{receipt_status}",
-        reply_markup=keyboard,
+        get_confirm_text(context.user_data),
+        reply_markup=confirm_keyboard(),
         parse_mode=ParseMode.HTML
     )
     return CONFIRM
@@ -774,24 +771,22 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         d = context.user_data
         user = update.effective_user
         user_name = full_name(user)
-        expense = {
-            'user_name': user_name,
-            'project': d['direction_name'],
+
+        gs = GoogleSheetsManager()
+        ok = gs.add_expense(user_name, {
             'subproject': d['subproject'],
             'category': d['category'],
             'amount': d['amount'],
             'description': d['description'],
             'receipt_url': d.get('receipt_url', ''),
-        }
-        gs = GoogleSheetsManager()
-        ok = gs.add_expense(expense)
+        })
 
         if ok:
             await query.edit_message_text(
                 f"✅ <b>Расход сохранён!</b>\n\n"
-                f"Проект: {expense['project']} / {expense['subproject']}\n"
-                f"Сумма: {expense['amount']} ₽\n"
-                f"Статус: Не принят",
+                f"Подпроект: {d['subproject']}\n"
+                f"Сумма: {d['amount']} ₽\n"
+                f"Статус: ⏳ Ожидает проверки",
                 parse_mode=ParseMode.HTML
             )
             admin_id = int(os.getenv('ADMIN_CHAT_ID', 0))
@@ -800,10 +795,10 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     caption = (
                         f"📊 <b>Новый расход</b>\n\n"
                         f"👤 {user_name}\n"
-                        f"🏗 {expense['project']} / {expense['subproject']}\n"
-                        f"🏷 {expense['category']}\n"
-                        f"💰 {expense['amount']} ₽\n"
-                        f"📝 {expense['description']}\n"
+                        f"🏗 {d.get('direction_name')} / {d['subproject']}\n"
+                        f"🏷 {d['category']}\n"
+                        f"💰 {d['amount']} ₽\n"
+                        f"📝 {d['description']}\n"
                         f"⏰ {datetime.now().strftime('%d.%m.%Y %H:%M')}"
                     )
                     if d.get('receipt_file_id'):
@@ -835,22 +830,21 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def edit_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    field = query.data
     context.user_data['editing'] = True
 
-    if field == 'edit_category':
+    if query.data == 'edit_category':
         await query.edit_message_text("🏷 Выберите новую категорию:", reply_markup=make_category_keyboard())
         return CATEGORY
-    elif field == 'edit_amount':
+    elif query.data == 'edit_amount':
         await query.edit_message_text("💰 Введите новую сумму:")
         return AMOUNT
-    elif field == 'edit_description':
+    elif query.data == 'edit_description':
         await query.edit_message_text("📝 Введите новое описание:")
         return DESCRIPTION
-    elif field == 'edit_receipt':
+    elif query.data == 'edit_receipt':
         await query.edit_message_text("📸 Отправьте новое фото чека:")
         return RECEIPT
-    elif field == 'edit_subproject':
+    elif query.data == 'edit_subproject':
         code = context.user_data.get('direction_code', 'СТ')
         subtype = context.user_data.get('subtype', 'Проект')
         if subtype == 'Гастроль':
@@ -859,11 +853,9 @@ async def edit_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             gs = GoogleSheetsManager()
             projects = gs.get_subprojects(code, 'Проект')
-            if not projects:
-                projects = ['Нет данных']
             await query.edit_message_text(
                 "📌 Выберите новый проект:",
-                reply_markup=make_keyboard(projects, cols=1)
+                reply_markup=make_keyboard(projects or ['Нет данных'], cols=1)
             )
             return SUBPROJECT
 
@@ -888,8 +880,7 @@ async def myexpenses_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         lines = ["📋 <b>Мои расходы (последние 20)</b>\n"]
         for e in expenses:
-            status_emoji = "✅" if e['status'] == 'Принят' else "⏳"
-            lines.append(f"{status_emoji} {e['date'][:10]} | {e['amount']} ₽ | {e['category']}")
+            lines.append(f"{e['status']} {e['date'][:10]} | {e['amount']} ₽ | {e['category']}")
         text = "\n".join(lines)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
 
