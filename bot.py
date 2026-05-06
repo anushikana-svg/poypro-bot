@@ -25,6 +25,9 @@ from telegram.constants import ParseMode
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+import io
 import json
 
 load_dotenv()
@@ -65,6 +68,16 @@ SHEET_HEADERS = [
 
 PHOTO_ROW_HEIGHT = 150
 
+# ─── Папка на Google Drive ───────────────────────────────────────────────────
+# Если хотите складывать чеки в конкретную папку — создайте её вручную на Drive
+# и вставьте ID сюда. Иначе файлы лягут в корень сервисного аккаунта.
+DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID', None)
+
+GOOGLE_SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive.file',   # ← добавлен Drive scope
+]
+
 
 def parse_date(text: str) -> Optional[tuple]:
     """Принимает ДД.ММ или ДД/ММ, проверяет корректность"""
@@ -83,59 +96,63 @@ def parse_date(text: str) -> Optional[tuple]:
         return None
 
 
-def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
-    """Загружает фото и возвращает публичную ссылку yadi.sk (без спецсимволов)"""
-    token = os.getenv('YANDEX_DISK_TOKEN')
-    if not token:
+def get_google_creds() -> Optional[Credentials]:
+    """Возвращает credentials с нужными scope"""
+    creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+    if not creds_json:
         return None
+    creds_data = json.loads(creds_json)
+    return Credentials.from_service_account_info(creds_data, scopes=GOOGLE_SCOPES)
+
+
+def upload_to_google_drive(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
+    """
+    Загружает фото в Google Drive через сервисный аккаунт.
+    Делает файл публично доступным и возвращает прямую ссылку для =IMAGE().
+    """
     try:
-        now = datetime.now()
-        folder = f"Чеки/{user_name}/{now.year}/{now.month:02d}"
-        for path in ["Чеки", f"Чеки/{user_name}",
-                     f"Чеки/{user_name}/{now.year}", folder]:
-            requests.put(
-                "https://cloud-api.yandex.net/v1/disk/resources",
-                headers={"Authorization": f"OAuth {token}"},
-                params={"path": path},
-                timeout=10
-            )
-
-        disk_path = f"{folder}/{filename}"
-
-        # Получаем URL для загрузки
-        resp = requests.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/upload",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path, "overwrite": "true"},
-            timeout=10
-        )
-        upload_url = resp.json().get("href")
-        if not upload_url:
+        creds = get_google_creds()
+        if not creds:
+            logger.error("Google credentials не найдены")
             return None
 
+        service = build('drive', 'v3', credentials=creds)
+
+        # Метаданные файла
+        file_metadata = {'name': filename}
+        if DRIVE_FOLDER_ID:
+            file_metadata['parents'] = [DRIVE_FOLDER_ID]
+
         # Загружаем файл
-        requests.put(upload_url, data=file_bytes, timeout=30)
-
-        # Публикуем и получаем короткую публичную ссылку yadi.sk
-        requests.put(
-            "https://cloud-api.yandex.net/v1/disk/resources/publish",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path},
-            timeout=10
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_bytes),
+            mimetype='image/jpeg',
+            resumable=False
         )
+        uploaded = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        ).execute()
 
-        meta = requests.get(
-            "https://cloud-api.yandex.net/v1/disk/resources",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path, "fields": "public_url"},
-            timeout=10
-        ).json()
+        file_id = uploaded.get('id')
+        if not file_id:
+            logger.error("Drive: не получен file_id")
+            return None
 
-        # Возвращаем публичную ссылку — она чистая, без & и спецсимволов
-        return meta.get("public_url")
+        # Открываем публичный доступ (чтение для всех)
+        service.permissions().create(
+            fileId=file_id,
+            body={'type': 'anyone', 'role': 'reader'},
+        ).execute()
+
+        # Прямая ссылка — работает в =IMAGE() в Google Sheets
+        direct_url = f"https://drive.google.com/uc?export=view&id={file_id}"
+        logger.info(f"Drive: файл загружен — {direct_url}")
+        return direct_url
 
     except Exception as e:
-        logger.error(f"Яндекс Диск ошибка: {e}")
+        logger.error(f"Google Drive ошибка: {e}")
         return None
 
 
@@ -146,15 +163,12 @@ class GoogleSheetsManager:
 
     def _connect(self):
         try:
-            creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
             sheets_id = os.getenv('GOOGLE_SHEETS_ID')
-            if not creds_json or not sheets_id:
+            if not sheets_id:
                 return
-            creds_data = json.loads(creds_json)
-            creds = Credentials.from_service_account_info(
-                creds_data,
-                scopes=['https://www.googleapis.com/auth/spreadsheets']
-            )
+            creds = get_google_creds()
+            if not creds:
+                return
             client = gspread.authorize(creds)
             self.spreadsheet = client.open_by_key(sheets_id)
             logger.info("Google Sheets подключен")
@@ -175,7 +189,6 @@ class GoogleSheetsManager:
         """Обновляет строку сотрудника на листе Баланс"""
         try:
             balance_sheet = self.get_or_create_balance_sheet()
-            # Ищем строку с этим сотрудником
             all_vals = balance_sheet.col_values(1)
             if user_name in all_vals:
                 row = all_vals.index(user_name) + 1
@@ -249,7 +262,7 @@ class GoogleSheetsManager:
                     ]
                 })
 
-                # Баланс K1:L7 — исправленные формулы без круговых ссылок
+                # Баланс K1:L7
                 balance_data = [
                     ['Баланс', ''],
                     ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
@@ -292,11 +305,11 @@ class GoogleSheetsManager:
                 return False
 
             receipt_url = data.get('receipt_url', '')
-            # Используем публичную ссылку yadi.sk — она без спецсимволов
-            if receipt_url and 'yadi.sk' in receipt_url:
+            # Прямая ссылка Google Drive работает в =IMAGE()
+            if receipt_url and 'drive.google.com' in receipt_url:
                 receipt_cell = f'=IMAGE("{receipt_url}",2)'
             else:
-                receipt_cell = receipt_url
+                receipt_cell = receipt_url  # fallback: просто ссылка
 
             row_data = [
                 'Расход',
@@ -461,7 +474,8 @@ def format_balance(b: Dict) -> str:
 
 
 def get_confirm_text(d: Dict) -> str:
-    receipt_status = "✅ Чек на Яндекс Диске" if d.get('receipt_on_yandex') else "✅ Чек загружен"
+    has_receipt = bool(d.get('receipt_url'))
+    receipt_status = "✅ Чек загружен" if has_receipt else "📸 Чек не загружен"
     return (
         f"📋 <b>Проверьте данные:</b>\n\n"
         f"🏗 Направление: <b>{d.get('direction_name', '')}</b>\n"
@@ -794,19 +808,19 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
-    await update.message.reply_text("⏳ Загружаю чек на Яндекс Диск...")
+    await update.message.reply_text("⏳ Загружаю чек на Google Drive...")
 
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     user_name = full_name(update.effective_user)
 
     file_bytes = await file.download_as_bytearray()
-    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
-    yandex_url = upload_to_yandex_disk(bytes(file_bytes), filename, user_name)
+    filename = f"{user_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
 
-    context.user_data['receipt_url'] = yandex_url or file.file_path
+    drive_url = upload_to_google_drive(bytes(file_bytes), filename, user_name)
+
+    context.user_data['receipt_url'] = drive_url or file.file_path
     context.user_data['receipt_file_id'] = photo.file_id
-    context.user_data['receipt_on_yandex'] = yandex_url is not None
 
     return await show_confirm_msg(update.message, context)
 
