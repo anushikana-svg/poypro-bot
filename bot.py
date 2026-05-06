@@ -63,6 +63,36 @@ SHEET_HEADERS = [
     'Статья расхода', 'Описание расхода', 'Расход принят', 'Закрыто', 'Чек'
 ]
 
+# Исправленные формулы баланса — L2=Выдано, L3=Принято, L4=В проверке, L5=Компенсировано
+BALANCE_DATA = [
+    ['Баланс', ''],
+    ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
+    ['Принято расходов', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000=TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
+    ['В проверке', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000<>TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
+    ['Компенсировано', '=SUMPRODUCT((A2:A1000="Компенсация")*(H2:H1000<>TRUE)*C2:C1000)'],
+    ['Остаток', '=L2-L3-L5'],
+    ['Реально на руках', '=L2-L3-L4-L5'],
+]
+
+PHOTO_ROW_HEIGHT = 150  # высота строки с фото в пикселях
+
+
+def parse_date(text: str) -> Optional[tuple]:
+    """Принимает ДД.ММ или ДД/ММ, проверяет корректность месяца"""
+    text = text.strip().replace('/', '.')
+    parts = text.split('.')
+    if len(parts) != 2:
+        return None
+    try:
+        day, month = int(parts[0]), int(parts[1])
+        if not (1 <= month <= 12):
+            return None
+        if not (1 <= day <= 31):
+            return None
+        return day, month
+    except:
+        return None
+
 
 def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
     token = os.getenv('YANDEX_DISK_TOKEN')
@@ -76,27 +106,31 @@ def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> O
             requests.put(
                 "https://cloud-api.yandex.net/v1/disk/resources",
                 headers={"Authorization": f"OAuth {token}"},
-                params={"path": path}
+                params={"path": path},
+                timeout=10
             )
         disk_path = f"{folder}/{filename}"
         resp = requests.get(
             "https://cloud-api.yandex.net/v1/disk/resources/upload",
             headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path, "overwrite": "true"}
+            params={"path": disk_path, "overwrite": "true"},
+            timeout=10
         )
         upload_url = resp.json().get("href")
         if not upload_url:
             return None
-        requests.put(upload_url, data=file_bytes)
+        requests.put(upload_url, data=file_bytes, timeout=30)
         requests.put(
             "https://cloud-api.yandex.net/v1/disk/resources/publish",
             headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path}
+            params={"path": disk_path},
+            timeout=10
         )
         download_resp = requests.get(
             "https://cloud-api.yandex.net/v1/disk/resources/download",
             headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path}
+            params={"path": disk_path},
+            timeout=10
         )
         return download_resp.json().get("href")
     except Exception as e:
@@ -134,7 +168,7 @@ class GoogleSheetsManager:
                 sheet = self.spreadsheet.add_worksheet(
                     title=user_name, rows=1000, cols=15
                 )
-                # Заголовки в A1:I1
+                # Заголовки A1:I1
                 sheet.update('A1:I1', [SHEET_HEADERS])
                 sheet.format('A1:I1', {
                     'textFormat': {'bold': True},
@@ -143,37 +177,58 @@ class GoogleSheetsManager:
 
                 # Флажки в G2:H1000
                 self.spreadsheet.batch_update({
-                    "requests": [{
-                        "repeatCell": {
-                            "range": {
-                                "sheetId": sheet.id,
-                                "startRowIndex": 1,
-                                "endRowIndex": 1000,
-                                "startColumnIndex": 6,
-                                "endColumnIndex": 8
-                            },
-                            "cell": {
-                                "dataValidation": {
-                                    "condition": {"type": "BOOLEAN"},
-                                    "strict": True
-                                }
-                            },
-                            "fields": "dataValidation"
+                    "requests": [
+                        {
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": sheet.id,
+                                    "startRowIndex": 1,
+                                    "endRowIndex": 1000,
+                                    "startColumnIndex": 6,
+                                    "endColumnIndex": 8
+                                },
+                                "cell": {
+                                    "dataValidation": {
+                                        "condition": {"type": "BOOLEAN"},
+                                        "strict": True
+                                    }
+                                },
+                                "fields": "dataValidation"
+                            }
+                        },
+                        # Высота строк для фото — 150px по умолчанию
+                        {
+                            "updateDimensionProperties": {
+                                "range": {
+                                    "sheetId": sheet.id,
+                                    "dimension": "ROWS",
+                                    "startIndex": 1,
+                                    "endIndex": 1000
+                                },
+                                "properties": {"pixelSize": PHOTO_ROW_HEIGHT},
+                                "fields": "pixelSize"
+                            }
+                        },
+                        # Ширина столбца I (Чек) — 200px
+                        {
+                            "updateDimensionProperties": {
+                                "range": {
+                                    "sheetId": sheet.id,
+                                    "dimension": "COLUMNS",
+                                    "startIndex": 8,
+                                    "endIndex": 9
+                                },
+                                "properties": {"pixelSize": 200},
+                                "fields": "pixelSize"
+                            }
                         }
-                    }]
+                    ]
                 })
 
-                # Баланс в K1:L8
-                balance_data = [
-                    ['Баланс', ''],
-                    ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
-                    ['Принято расходов', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000=TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
-                    ['Ожидает проверки', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000<>TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
-                    ['Компенсировано', '=SUMPRODUCT((A2:A1000="Компенсация")*(H2:H1000<>TRUE)*C2:C1000)'],
-                    ['Остаток', '=L3-L4-L6'],
-                    ['Реально на руках', '=L3-L4-L5-L6'],
-                ]
-                sheet.update('K1:L7', balance_data, value_input_option='USER_ENTERED')
+                # Баланс K1:L7 с исправленными формулами
+                sheet.update('K1:L7', BALANCE_DATA, value_input_option='USER_ENTERED')
+                sheet.format('K1:L1', {'textFormat': {'bold': True}})
+
                 logger.info(f"Создан лист для {user_name}")
                 return sheet
         except Exception as e:
@@ -181,7 +236,6 @@ class GoogleSheetsManager:
             return None
 
     def _next_empty_row(self, sheet) -> int:
-        """Найти первую пустую строку в колонке A начиная со строки 2"""
         col_a = sheet.col_values(1)
         return len(col_a) + 1
 
@@ -206,7 +260,8 @@ class GoogleSheetsManager:
 
             receipt_url = data.get('receipt_url', '')
             if receipt_url and 'yandex' in receipt_url:
-                receipt_cell = f'=IMAGE("{receipt_url}")'
+                # IMAGE с размером 2 = растянуть по ячейке
+                receipt_cell = f'=IMAGE("{receipt_url}",2)'
             else:
                 receipt_cell = receipt_url
 
@@ -222,7 +277,6 @@ class GoogleSheetsManager:
                 receipt_cell,
             ]
 
-            # Записываем в первую пустую строку колонки A
             next_row = self._next_empty_row(sheet)
             sheet.update(
                 f'A{next_row}:I{next_row}',
@@ -312,7 +366,7 @@ class GoogleSheetsManager:
                         'date': row[1],
                         'amount': row[2],
                         'category': row[4],
-                        'status': '✅ Принят' if accepted else '⏳ Ожидает',
+                        'status': '✅ Принят' if accepted else '🔍 В проверке',
                     })
             return result[-20:]
         except:
@@ -365,7 +419,7 @@ def format_balance(b: Dict) -> str:
     text = "💰 <b>Ваш баланс</b>\n\n"
     text += f"Выдано: <b>{b['issued']:,.2f} ₽</b>\n"
     text += f"\n✅ Принято расходов: <b>{b['accepted']:,.2f} ₽</b>\n"
-    text += f"⏳ Ожидает проверки: <b>{b['pending']:,.2f} ₽</b>\n"
+    text += f"🔍 В проверке: <b>{b['pending']:,.2f} ₽</b>\n"
     text += f"💸 Компенсировано: <b>{b['compensated']:,.2f} ₽</b>\n"
     text += f"─────────────────\n"
     text += f"Остаток (принятые): <b>{b['balance']:,.2f} ₽</b>\n"
@@ -497,7 +551,7 @@ async def subtype_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(
                 f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n"
                 f"✅ Тип: <b>Гастроль</b>\n\n"
-                "📅 Введите дату в формате <b>ДД.ММ</b>:",
+                "📅 Введите дату в формате <b>ДД.ММ</b> или <b>ДД/ММ</b>:",
                 parse_mode=ParseMode.HTML
             )
             return GASTROL_DATE
@@ -534,7 +588,7 @@ async def gastrol_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if query.data == '➕ Другая дата':
         await query.edit_message_text(
-            "📅 Введите дату в формате <b>ДД.ММ</b>:",
+            "📅 Введите дату в формате <b>ДД.ММ</b> или <b>ДД/ММ</b>:",
             parse_mode=ParseMode.HTML
         )
         return GASTROL_DATE
@@ -551,15 +605,18 @@ async def gastrol_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def gastrol_date_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    parts = text.split('.')
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+    parsed = parse_date(text)
+
+    if not parsed:
         await update.message.reply_text(
-            "❌ Неверный формат. Введите дату <b>ДД.ММ</b>, например <b>15.06</b>:",
+            "❌ Неверный формат или месяц. Введите дату <b>ДД.ММ</b> или <b>ДД/ММ</b>, например <b>15.06</b>:",
             parse_mode=ParseMode.HTML
         )
         return GASTROL_DATE
 
-    context.user_data['gastrol_date'] = text
+    day, month = parsed
+    date_str = f"{day:02d}.{month:02d}"
+    context.user_data['gastrol_date'] = date_str
     current_month = datetime.now().month
 
     if current_month >= 10:
@@ -569,7 +626,7 @@ async def gastrol_date_received(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton(str(current_year + 1), callback_data=f"year_{current_year + 1}"),
         ]])
         await update.message.reply_text(
-            f"✅ Дата: <b>{text}</b>\n\n📅 Выберите год:",
+            f"✅ Дата: <b>{date_str}</b>\n\n📅 Выберите год:",
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
@@ -577,7 +634,7 @@ async def gastrol_date_received(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         context.user_data['gastrol_year'] = datetime.now().year
         await update.message.reply_text(
-            f"✅ Дата: <b>{text}.{datetime.now().year}</b>\n\n"
+            f"✅ Дата: <b>{date_str}.{datetime.now().year}</b>\n\n"
             "🏙 Введите город (или <b>-</b> чтобы пропустить):",
             parse_mode=ParseMode.HTML
         )
@@ -704,6 +761,9 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
+    # Сразу сообщаем что фото получено
+    await update.message.reply_text("⏳ Загружаю чек на Яндекс Диск...")
+
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     user_name = full_name(update.effective_user)
@@ -786,7 +846,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"✅ <b>Расход сохранён!</b>\n\n"
                 f"Гастроль/Проект: {d['subproject']}\n"
                 f"Сумма: {d['amount']} ₽\n"
-                f"Статус: ⏳ Ожидает проверки",
+                f"Статус: 🔍 В проверке",
                 parse_mode=ParseMode.HTML
             )
             admin_id = int(os.getenv('ADMIN_CHAT_ID', 0))
@@ -858,7 +918,10 @@ async def edit_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 return GASTROL_CHOOSE
             else:
-                await query.edit_message_text("📅 Введите новую дату гастроли (ДД.ММ):")
+                await query.edit_message_text(
+                    "📅 Введите новую дату гастроли (<b>ДД.ММ</b> или <b>ДД/ММ</b>):",
+                    parse_mode=ParseMode.HTML
+                )
                 return GASTROL_DATE
         else:
             gs = GoogleSheetsManager()
