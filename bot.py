@@ -63,22 +63,11 @@ SHEET_HEADERS = [
     'Статья расхода', 'Описание расхода', 'Расход принят', 'Закрыто', 'Чек'
 ]
 
-# Исправленные формулы баланса — L2=Выдано, L3=Принято, L4=В проверке, L5=Компенсировано
-BALANCE_DATA = [
-    ['Баланс', ''],
-    ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
-    ['Принято расходов', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000=TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
-    ['В проверке', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000<>TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
-    ['Компенсировано', '=SUMPRODUCT((A2:A1000="Компенсация")*(H2:H1000<>TRUE)*C2:C1000)'],
-    ['Остаток', '=L2-L3-L5'],
-    ['Реально на руках', '=L2-L3-L4-L5'],
-]
-
-PHOTO_ROW_HEIGHT = 150  # высота строки с фото в пикселях
+PHOTO_ROW_HEIGHT = 150
 
 
 def parse_date(text: str) -> Optional[tuple]:
-    """Принимает ДД.ММ или ДД/ММ, проверяет корректность месяца"""
+    """Принимает ДД.ММ или ДД/ММ, проверяет корректность"""
     text = text.strip().replace('/', '.')
     parts = text.split('.')
     if len(parts) != 2:
@@ -95,6 +84,7 @@ def parse_date(text: str) -> Optional[tuple]:
 
 
 def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
+    """Загружает фото и возвращает публичную ссылку yadi.sk (без спецсимволов)"""
     token = os.getenv('YANDEX_DISK_TOKEN')
     if not token:
         return None
@@ -109,7 +99,10 @@ def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> O
                 params={"path": path},
                 timeout=10
             )
+
         disk_path = f"{folder}/{filename}"
+
+        # Получаем URL для загрузки
         resp = requests.get(
             "https://cloud-api.yandex.net/v1/disk/resources/upload",
             headers={"Authorization": f"OAuth {token}"},
@@ -119,20 +112,28 @@ def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> O
         upload_url = resp.json().get("href")
         if not upload_url:
             return None
+
+        # Загружаем файл
         requests.put(upload_url, data=file_bytes, timeout=30)
+
+        # Публикуем и получаем короткую публичную ссылку yadi.sk
         requests.put(
             "https://cloud-api.yandex.net/v1/disk/resources/publish",
             headers={"Authorization": f"OAuth {token}"},
             params={"path": disk_path},
             timeout=10
         )
-        download_resp = requests.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/download",
+
+        meta = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/resources",
             headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path},
+            params={"path": disk_path, "fields": "public_url"},
             timeout=10
-        )
-        return download_resp.json().get("href")
+        ).json()
+
+        # Возвращаем публичную ссылку — она чистая, без & и спецсимволов
+        return meta.get("public_url")
+
     except Exception as e:
         logger.error(f"Яндекс Диск ошибка: {e}")
         return None
@@ -160,14 +161,39 @@ class GoogleSheetsManager:
         except Exception as e:
             logger.error(f"Ошибка подключения: {e}")
 
+    def get_or_create_balance_sheet(self):
+        """Создаёт или получает общий лист баланса"""
+        try:
+            return self.spreadsheet.worksheet('Баланс')
+        except WorksheetNotFound:
+            sheet = self.spreadsheet.add_worksheet(title='Баланс', rows=100, cols=10)
+            sheet.update('A1:B1', [['Сотрудник', 'Перейти к расходам']])
+            sheet.format('A1:B1', {'textFormat': {'bold': True}})
+            return sheet
+
+    def update_balance_sheet(self, user_name: str):
+        """Обновляет строку сотрудника на листе Баланс"""
+        try:
+            balance_sheet = self.get_or_create_balance_sheet()
+            # Ищем строку с этим сотрудником
+            all_vals = balance_sheet.col_values(1)
+            if user_name in all_vals:
+                row = all_vals.index(user_name) + 1
+            else:
+                row = len(all_vals) + 1
+                balance_sheet.update_cell(row, 1, user_name)
+        except Exception as e:
+            logger.error(f"Ошибка обновления баланса: {e}")
+
     def get_or_create_employee_sheet(self, user_name: str):
         try:
             try:
                 return self.spreadsheet.worksheet(user_name)
             except WorksheetNotFound:
                 sheet = self.spreadsheet.add_worksheet(
-                    title=user_name, rows=1000, cols=15
+                    title=user_name, rows=1000, cols=12
                 )
+
                 # Заголовки A1:I1
                 sheet.update('A1:I1', [SHEET_HEADERS])
                 sheet.format('A1:I1', {
@@ -175,7 +201,7 @@ class GoogleSheetsManager:
                     'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
                 })
 
-                # Флажки в G2:H1000
+                # Флажки G2:H1000 + высота строк + ширина столбца чека
                 self.spreadsheet.batch_update({
                     "requests": [
                         {
@@ -196,7 +222,6 @@ class GoogleSheetsManager:
                                 "fields": "dataValidation"
                             }
                         },
-                        # Высота строк для фото — 150px по умолчанию
                         {
                             "updateDimensionProperties": {
                                 "range": {
@@ -209,7 +234,6 @@ class GoogleSheetsManager:
                                 "fields": "pixelSize"
                             }
                         },
-                        # Ширина столбца I (Чек) — 200px
                         {
                             "updateDimensionProperties": {
                                 "range": {
@@ -225,9 +249,18 @@ class GoogleSheetsManager:
                     ]
                 })
 
-                # Баланс K1:L7 с исправленными формулами
-                sheet.update('K1:L7', BALANCE_DATA, value_input_option='USER_ENTERED')
-                sheet.format('K1:L1', {'textFormat': {'bold': True}})
+                # Баланс K1:L7 — исправленные формулы без круговых ссылок
+                balance_data = [
+                    ['Баланс', ''],
+                    ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['Принято расходов', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000=TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['В проверке', '=SUMPRODUCT((A2:A1000="Расход")*(G2:G1000<>TRUE)*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['Компенсировано', '=SUMPRODUCT((A2:A1000="Компенсация")*(H2:H1000<>TRUE)*C2:C1000)'],
+                    ['Остаток', '=L2-L3-L5'],
+                    ['Реально на руках', '=L2-L3-L4-L5'],
+                ]
+                sheet.update('K1:L7', balance_data, value_input_option='USER_ENTERED')
+                sheet.format('K1', {'textFormat': {'bold': True}})
 
                 logger.info(f"Создан лист для {user_name}")
                 return sheet
@@ -259,8 +292,8 @@ class GoogleSheetsManager:
                 return False
 
             receipt_url = data.get('receipt_url', '')
-            if receipt_url and 'yandex' in receipt_url:
-                # IMAGE с размером 2 = растянуть по ячейке
+            # Используем публичную ссылку yadi.sk — она без спецсимволов
+            if receipt_url and 'yadi.sk' in receipt_url:
                 receipt_cell = f'=IMAGE("{receipt_url}",2)'
             else:
                 receipt_cell = receipt_url
@@ -761,7 +794,6 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
-    # Сразу сообщаем что фото получено
     await update.message.reply_text("⏳ Загружаю чек на Яндекс Диск...")
 
     photo = update.message.photo[-1]
