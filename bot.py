@@ -59,8 +59,10 @@ CAT_CODES = {f'cat_{i}': cat for i, cat in enumerate(CATEGORIES)}
 
 SHEET_HEADERS = [
     'Тип', 'Дата', 'Сумма', 'Гастроль/Проект',
-    'Статья расхода', 'Описание расхода', 'Расход принят', 'Закрыто', 'Чек'
+    'Статья расхода', 'Описание расхода', 'Расход принят', 'Закрыто',
+    'Чек 1', 'Чек 2', 'Чек 3'
 ]
+MAX_PHOTOS = 3
 
 PHOTO_ROW_HEIGHT = 375
 
@@ -277,8 +279,8 @@ class GoogleSheetsManager:
             try:
                 return self.spreadsheet.worksheet(user_name)
             except WorksheetNotFound:
-                sheet = self.spreadsheet.add_worksheet(title=user_name, rows=1000, cols=9)
-                sheet.update('A1:I1', [SHEET_HEADERS])
+                sheet = self.spreadsheet.add_worksheet(title=user_name, rows=1000, cols=12)
+                sheet.update('A1:K1', [SHEET_HEADERS])
                 sheet.format('A1:I1', {
                     'textFormat': {'bold': True},
                     'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
@@ -303,7 +305,7 @@ class GoogleSheetsManager:
                     {   # Ширина столбца Чек
                         "updateDimensionProperties": {
                             "range": {"sheetId": sheet.id, "dimension": "COLUMNS",
-                                      "startIndex": 8, "endIndex": 9},
+                                      "startIndex": 8, "endIndex": 11},
                             "properties": {"pixelSize": 500}, "fields": "pixelSize"
                         }
                     },
@@ -335,10 +337,13 @@ class GoogleSheetsManager:
             if not sheet:
                 return False
 
-            receipt_url = data.get('receipt_url', '')
-            receipt_cell = f'=IMAGE("{receipt_url}";2)' if receipt_url else ''
+            # До 3 чеков в отдельных столбцах
+            receipt_urls = data.get('receipt_urls', [])
+            receipt_cells = [f'=IMAGE("{url}";2)' if url else '' for url in receipt_urls[:3]]
+            while len(receipt_cells) < 3:
+                receipt_cells.append('')
 
-            amount_val = data.get('amount', 0)  # float — храним как число
+            amount_val = data.get('amount', 0)
 
             row_data = [
                 'Расход',
@@ -349,10 +354,10 @@ class GoogleSheetsManager:
                 data.get('description', ''),
                 False,
                 False,
-                receipt_cell,
-            ]
+            ] + receipt_cells  # Чек 1, Чек 2, Чек 3
+
             next_row = self._next_empty_row(sheet)
-            sheet.update(f'A{next_row}:I{next_row}',
+            sheet.update(f'A{next_row}:K{next_row}',
                          [row_data], value_input_option='USER_ENTERED')
             self.update_balance_sheet(user_name)
             return True
@@ -481,7 +486,9 @@ def format_balance(b: Dict) -> str:
 def get_confirm_text(d: Dict) -> str:
     amount_val = d.get('amount', 0)
     amount_display = fmt_money(amount_val) if isinstance(amount_val, (int, float)) else amount_val
-    receipt_status = "✅ Чек прикреплён" if d.get('receipt_url') else "📸 Чек не загружен"
+    urls = d.get('receipt_urls', [])
+    count = len([u for u in urls if u])
+    receipt_status = f"✅ Чеков загружено: {count}" if count else "📸 Чек не загружен"
     return (
         f"📋 <b>Проверьте данные:</b>\n\n"
         f"🏗 Направление: <b>{d.get('direction_name', '')}</b>\n"
@@ -749,16 +756,30 @@ async def description_received(update: Update, context: ContextTypes.DEFAULT_TYP
     if context.user_data.get('editing'):
         context.user_data.pop('editing')
         return await show_confirm_msg(update.message, context)
+    context.user_data['receipt_urls'] = []  # инициализируем список чеков
+    context.user_data.pop('receipt_file_id', None)
     await update.message.reply_text(
-        f"✅ Описание: <b>{text}</b>\n\n📸 Отправьте фото чека:",
+        f"✅ Описание: <b>{text}</b>\n\n📸 Отправьте фото чека (до 3 штук, по одному):",
         parse_mode=ParseMode.HTML
     )
     return RECEIPT
 
 
 async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Кнопка Готово
+    if update.message.text and update.message.text.strip() in ('Готово', 'готово', '✅ Готово'):
+        if not context.user_data.get('receipt_urls'):
+            await update.message.reply_text("❌ Нужно отправить хотя бы одно фото чека:")
+            return RECEIPT
+        return await show_confirm_msg(update.message, context)
+
     if not update.message.photo:
         await update.message.reply_text("❌ Нужно отправить фото чека:")
+        return RECEIPT
+
+    receipt_urls = context.user_data.get('receipt_urls', [])
+    if len(receipt_urls) >= 3:
+        await update.message.reply_text("⚠️ Максимум 3 фото. Нажмите ✅ Готово.")
         return RECEIPT
 
     await update.message.reply_text("⏳ Загружаю чек...")
@@ -768,9 +789,34 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     img_url = await upload_receipt(context.bot, photo.file_id, filename, user_name)
 
-    context.user_data['receipt_url'] = img_url or ''
-    context.user_data['receipt_file_id'] = photo.file_id
-    return await show_confirm_msg(update.message, context)
+    if img_url:
+        receipt_urls.append(img_url)
+        context.user_data['receipt_urls'] = receipt_urls
+        # Сохраняем первый file_id для уведомления админу
+        if 'receipt_file_id' not in context.user_data:
+            context.user_data['receipt_file_id'] = photo.file_id
+
+    count = len(receipt_urls)
+    if count < 3:
+        await update.message.reply_text(
+            f"✅ Чек {count} загружен.\n\nОтправьте ещё фото или нажмите ✅ Готово.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Готово", callback_data="receipts_done")
+            ]])
+        )
+        return RECEIPT
+    else:
+        await update.message.reply_text("✅ Все 3 чека загружены.")
+        return await show_confirm_msg(update.message, context)
+
+
+async def receipts_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if not context.user_data.get('receipt_urls'):
+        await query.edit_message_text("❌ Нужно отправить хотя бы одно фото чека:")
+        return RECEIPT
+    return await show_confirm_msg(query.message, context)
 
 
 async def show_confirm_msg(message, context):
@@ -826,7 +872,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             'category': d['category'],
             'amount': d.get('amount', 0),
             'description': d['description'],
-            'receipt_url': d.get('receipt_url', ''),
+            'receipt_urls': d.get('receipt_urls', []),
         })
 
         if ok:
@@ -951,6 +997,7 @@ def main():
             AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_received)],
             DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_received)],
             RECEIPT: [
+                CallbackQueryHandler(receipts_done_handler, pattern='^receipts_done$'),
                 MessageHandler(filters.PHOTO, receipt_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_received),
             ],
