@@ -5,9 +5,9 @@ Expense Tracker Bot для Telegram
 """
 
 import os
-import io
 import logging
 import json
+import requests
 from datetime import datetime
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
@@ -26,8 +26,6 @@ from telegram.constants import ParseMode
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 load_dotenv()
 
@@ -137,32 +135,67 @@ def get_google_creds() -> Optional[Credentials]:
 
 # ─── Google Drive ─────────────────────────────────────────────────────────────
 
-def upload_to_google_drive(file_bytes: bytes, filename: str) -> Optional[str]:
-    """Загружает фото, открывает доступ, возвращает прямую ссылку для =IMAGE()"""
+def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
+    """
+    Загружает фото на Яндекс Диск и возвращает прямую ссылку для скачивания.
+    Эта ссылка работает в =IMAGE() в Google Sheets.
+    """
+    token = os.getenv('YANDEX_DISK_TOKEN')
+    if not token:
+        return None
     try:
-        creds = get_google_creds()
-        if not creds:
+        now = datetime.now()
+        folder = f"Чеки/{user_name}/{now.year}/{now.month:02d}"
+        for path in ["Чеки", f"Чеки/{user_name}",
+                     f"Чеки/{user_name}/{now.year}", folder]:
+            requests.put(
+                "https://cloud-api.yandex.net/v1/disk/resources",
+                headers={"Authorization": f"OAuth {token}"},
+                params={"path": path},
+                timeout=10
+            )
+
+        disk_path = f"{folder}/{filename}"
+
+        # Получаем URL для загрузки
+        resp = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/resources/upload",
+            headers={"Authorization": f"OAuth {token}"},
+            params={"path": disk_path, "overwrite": "true"},
+            timeout=10
+        )
+        upload_url = resp.json().get("href")
+        if not upload_url:
             return None
-        service = build('drive', 'v3', credentials=creds)
 
-        meta = {'name': filename}
-        if DRIVE_FOLDER_ID:
-            meta['parents'] = [DRIVE_FOLDER_ID]
+        # Загружаем файл
+        requests.put(upload_url, data=file_bytes, timeout=30)
 
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype='image/jpeg', resumable=False)
-        file_id = service.files().create(body=meta, media_body=media, fields='id').execute().get('id')
-        if not file_id:
-            return None
+        # Публикуем файл
+        requests.put(
+            "https://cloud-api.yandex.net/v1/disk/resources/publish",
+            headers={"Authorization": f"OAuth {token}"},
+            params={"path": disk_path},
+            timeout=10
+        )
 
-        service.permissions().create(
-            fileId=file_id, body={'type': 'anyone', 'role': 'reader'}
-        ).execute()
+        # Получаем прямую ссылку на скачивание (не yadi.sk, а прямой URL)
+        dl_resp = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/resources/download",
+            headers={"Authorization": f"OAuth {token}"},
+            params={"path": disk_path},
+            timeout=10
+        )
+        direct_url = dl_resp.json().get("href")
+        if direct_url:
+            logger.info(f"Яндекс Диск: загружено, прямая ссылка получена")
+            return direct_url
 
-        url = f"https://drive.google.com/uc?export=view&id={file_id}"
-        logger.info(f"Drive: загружено {url}")
-        return url
+        logger.error("Яндекс Диск: не удалось получить прямую ссылку")
+        return None
+
     except Exception as e:
-        logger.error(f"Drive ошибка: {e}")
+        logger.error(f"Яндекс Диск ошибка: {e}")
         return None
 
 
@@ -314,7 +347,7 @@ class GoogleSheetsManager:
                 return False
 
             receipt_url = data.get('receipt_url', '')
-            receipt_cell = f'=IMAGE("{receipt_url}",2)' if receipt_url and 'drive.google.com' in receipt_url else receipt_url
+            receipt_cell = f'=IMAGE("{receipt_url}",2)' if receipt_url else ''
 
             amount_val = data.get('amount', 0)  # float — храним как число
 
@@ -455,7 +488,7 @@ def format_balance(b: Dict) -> str:
 def get_confirm_text(d: Dict) -> str:
     amount_val = d.get('amount', 0)
     amount_display = fmt_money(amount_val) if isinstance(amount_val, (int, float)) else amount_val
-    receipt_status = "✅ Чек загружен на Google Drive" if d.get('receipt_url') else "📸 Чек не загружен"
+    receipt_status = "✅ Чек загружен на Яндекс Диск" if d.get('receipt_url') else "📸 Чек не загружен"
     return (
         f"📋 <b>Проверьте данные:</b>\n\n"
         f"🏗 Направление: <b>{d.get('direction_name', '')}</b>\n"
@@ -735,16 +768,16 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
-    await update.message.reply_text("⏳ Загружаю чек на Google Drive...")
+    await update.message.reply_text("⏳ Загружаю чек на Яндекс Диск...")
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     user_name = full_name(update.effective_user)
 
     file_bytes = await file.download_as_bytearray()
-    filename = f"{user_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
-    drive_url = upload_to_google_drive(bytes(file_bytes), filename)
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
+    yandex_url = upload_to_yandex_disk(bytes(file_bytes), filename, user_name)
 
-    context.user_data['receipt_url'] = drive_url or ''
+    context.user_data['receipt_url'] = yandex_url or ''
     context.user_data['receipt_file_id'] = photo.file_id
     return await show_confirm_msg(update.message, context)
 
