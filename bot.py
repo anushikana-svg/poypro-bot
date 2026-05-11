@@ -7,7 +7,6 @@ Expense Tracker Bot для Telegram
 import os
 import logging
 import json
-import requests
 from datetime import datetime
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
@@ -65,12 +64,7 @@ SHEET_HEADERS = [
 
 PHOTO_ROW_HEIGHT = 150
 
-GOOGLE_SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive.file',
-]
-
-DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID', None)
+GOOGLE_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
 
 # ─── Форматирование чисел ────────────────────────────────────────────────────
@@ -135,67 +129,19 @@ def get_google_creds() -> Optional[Credentials]:
 
 # ─── Google Drive ─────────────────────────────────────────────────────────────
 
-def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
+async def get_telegram_file_url(bot, file_id: str) -> Optional[str]:
     """
-    Загружает фото на Яндекс Диск и возвращает прямую ссылку для скачивания.
-    Эта ссылка работает в =IMAGE() в Google Sheets.
+    Получает постоянную прямую ссылку на фото через Telegram Bot API.
+    Ссылка работает в =IMAGE() в Google Sheets пока действует токен бота.
     """
-    token = os.getenv('YANDEX_DISK_TOKEN')
-    if not token:
-        return None
     try:
-        now = datetime.now()
-        folder = f"Чеки/{user_name}/{now.year}/{now.month:02d}"
-        for path in ["Чеки", f"Чеки/{user_name}",
-                     f"Чеки/{user_name}/{now.year}", folder]:
-            requests.put(
-                "https://cloud-api.yandex.net/v1/disk/resources",
-                headers={"Authorization": f"OAuth {token}"},
-                params={"path": path},
-                timeout=10
-            )
-
-        disk_path = f"{folder}/{filename}"
-
-        # Получаем URL для загрузки
-        resp = requests.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/upload",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path, "overwrite": "true"},
-            timeout=10
-        )
-        upload_url = resp.json().get("href")
-        if not upload_url:
-            return None
-
-        # Загружаем файл
-        requests.put(upload_url, data=file_bytes, timeout=30)
-
-        # Публикуем файл
-        requests.put(
-            "https://cloud-api.yandex.net/v1/disk/resources/publish",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path},
-            timeout=10
-        )
-
-        # Получаем прямую ссылку на скачивание (не yadi.sk, а прямой URL)
-        dl_resp = requests.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/download",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"path": disk_path},
-            timeout=10
-        )
-        direct_url = dl_resp.json().get("href")
-        if direct_url:
-            logger.info(f"Яндекс Диск: загружено, прямая ссылка получена")
-            return direct_url
-
-        logger.error("Яндекс Диск: не удалось получить прямую ссылку")
-        return None
-
+        token = os.getenv('TELEGRAM_BOT_TOKEN')
+        file = await bot.get_file(file_id)
+        url = f"https://api.telegram.org/file/bot{token}/{file.file_path}"
+        logger.info(f"Telegram file URL: {url}")
+        return url
     except Exception as e:
-        logger.error(f"Яндекс Диск ошибка: {e}")
+        logger.error(f"Telegram file URL ошибка: {e}")
         return None
 
 
@@ -488,7 +434,7 @@ def format_balance(b: Dict) -> str:
 def get_confirm_text(d: Dict) -> str:
     amount_val = d.get('amount', 0)
     amount_display = fmt_money(amount_val) if isinstance(amount_val, (int, float)) else amount_val
-    receipt_status = "✅ Чек загружен на Яндекс Диск" if d.get('receipt_url') else "📸 Чек не загружен"
+    receipt_status = "✅ Чек прикреплён" if d.get('receipt_url') else "📸 Чек не загружен"
     return (
         f"📋 <b>Проверьте данные:</b>\n\n"
         f"🏗 Направление: <b>{d.get('direction_name', '')}</b>\n"
@@ -768,16 +714,12 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
-    await update.message.reply_text("⏳ Загружаю чек на Яндекс Диск...")
+    await update.message.reply_text("⏳ Получаю ссылку на чек...")
     photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    user_name = full_name(update.effective_user)
 
-    file_bytes = await file.download_as_bytearray()
-    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
-    yandex_url = upload_to_yandex_disk(bytes(file_bytes), filename, user_name)
+    tg_url = await get_telegram_file_url(context.bot, photo.file_id)
 
-    context.user_data['receipt_url'] = yandex_url or ''
+    context.user_data['receipt_url'] = tg_url or ''
     context.user_data['receipt_file_id'] = photo.file_id
     return await show_confirm_msg(update.message, context)
 
