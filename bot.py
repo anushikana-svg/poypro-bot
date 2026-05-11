@@ -25,9 +25,6 @@ from telegram.constants import ParseMode
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-import io
 import json
 
 load_dotenv()
@@ -68,19 +65,8 @@ SHEET_HEADERS = [
 
 PHOTO_ROW_HEIGHT = 150
 
-# ─── Папка на Google Drive ───────────────────────────────────────────────────
-# Если хотите складывать чеки в конкретную папку — создайте её вручную на Drive
-# и вставьте ID сюда. Иначе файлы лягут в корень сервисного аккаунта.
-DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID', None)
-
-GOOGLE_SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive.file',   # ← добавлен Drive scope
-]
-
 
 def parse_date(text: str) -> Optional[tuple]:
-    """Принимает ДД.ММ или ДД/ММ, проверяет корректность"""
     text = text.strip().replace('/', '.')
     parts = text.split('.')
     if len(parts) != 2:
@@ -96,63 +82,55 @@ def parse_date(text: str) -> Optional[tuple]:
         return None
 
 
-def get_google_creds() -> Optional[Credentials]:
-    """Возвращает credentials с нужными scope"""
-    creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-    if not creds_json:
+def upload_to_yandex_disk(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
+    """Загружает фото и возвращает публичную ссылку yadi.sk"""
+    token = os.getenv('YANDEX_DISK_TOKEN')
+    if not token:
         return None
-    creds_data = json.loads(creds_json)
-    return Credentials.from_service_account_info(creds_data, scopes=GOOGLE_SCOPES)
-
-
-def upload_to_google_drive(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
-    """
-    Загружает фото в Google Drive через сервисный аккаунт.
-    Делает файл публично доступным и возвращает прямую ссылку для =IMAGE().
-    """
     try:
-        creds = get_google_creds()
-        if not creds:
-            logger.error("Google credentials не найдены")
-            return None
+        now = datetime.now()
+        folder = f"Чеки/{user_name}/{now.year}/{now.month:02d}"
+        for path in ["Чеки", f"Чеки/{user_name}",
+                     f"Чеки/{user_name}/{now.year}", folder]:
+            requests.put(
+                "https://cloud-api.yandex.net/v1/disk/resources",
+                headers={"Authorization": f"OAuth {token}"},
+                params={"path": path},
+                timeout=10
+            )
 
-        service = build('drive', 'v3', credentials=creds)
+        disk_path = f"{folder}/{filename}"
 
-        # Метаданные файла
-        file_metadata = {'name': filename}
-        if DRIVE_FOLDER_ID:
-            file_metadata['parents'] = [DRIVE_FOLDER_ID]
-
-        # Загружаем файл
-        media = MediaIoBaseUpload(
-            io.BytesIO(file_bytes),
-            mimetype='image/jpeg',
-            resumable=False
+        resp = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/resources/upload",
+            headers={"Authorization": f"OAuth {token}"},
+            params={"path": disk_path, "overwrite": "true"},
+            timeout=10
         )
-        uploaded = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id'
-        ).execute()
-
-        file_id = uploaded.get('id')
-        if not file_id:
-            logger.error("Drive: не получен file_id")
+        upload_url = resp.json().get("href")
+        if not upload_url:
             return None
 
-        # Открываем публичный доступ (чтение для всех)
-        service.permissions().create(
-            fileId=file_id,
-            body={'type': 'anyone', 'role': 'reader'},
-        ).execute()
+        requests.put(upload_url, data=file_bytes, timeout=30)
 
-        # Прямая ссылка — работает в =IMAGE() в Google Sheets
-        direct_url = f"https://drive.google.com/uc?export=view&id={file_id}"
-        logger.info(f"Drive: файл загружен — {direct_url}")
-        return direct_url
+        requests.put(
+            "https://cloud-api.yandex.net/v1/disk/resources/publish",
+            headers={"Authorization": f"OAuth {token}"},
+            params={"path": disk_path},
+            timeout=10
+        )
+
+        meta = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/resources",
+            headers={"Authorization": f"OAuth {token}"},
+            params={"path": disk_path, "fields": "public_url"},
+            timeout=10
+        ).json()
+
+        return meta.get("public_url")
 
     except Exception as e:
-        logger.error(f"Google Drive ошибка: {e}")
+        logger.error(f"Яндекс Диск ошибка: {e}")
         return None
 
 
@@ -163,40 +141,107 @@ class GoogleSheetsManager:
 
     def _connect(self):
         try:
+            creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
             sheets_id = os.getenv('GOOGLE_SHEETS_ID')
-            if not sheets_id:
+            if not creds_json or not sheets_id:
                 return
-            creds = get_google_creds()
-            if not creds:
-                return
+            creds_data = json.loads(creds_json)
+            creds = Credentials.from_service_account_info(
+                creds_data,
+                scopes=['https://www.googleapis.com/auth/spreadsheets']
+            )
             client = gspread.authorize(creds)
             self.spreadsheet = client.open_by_key(sheets_id)
             logger.info("Google Sheets подключен")
         except Exception as e:
             logger.error(f"Ошибка подключения: {e}")
 
+    # ─── ГЛАВНАЯ — дашборд всех сотрудников ──────────────────────────────────
+
+    DASHBOARD_HEADERS = [
+        'Сотрудник', 'Выдано', 'Принято расходов',
+        'В проверке', 'Компенсировано', 'Остаток', 'Реально на руках'
+    ]
+
     def get_or_create_balance_sheet(self):
-        """Создаёт или получает общий лист баланса"""
+        """Создаёт или получает титульный лист Главная"""
         try:
-            return self.spreadsheet.worksheet('Баланс')
+            return self.spreadsheet.worksheet('Главная')
         except WorksheetNotFound:
-            sheet = self.spreadsheet.add_worksheet(title='Баланс', rows=100, cols=10)
-            sheet.update('A1:B1', [['Сотрудник', 'Перейти к расходам']])
-            sheet.format('A1:B1', {'textFormat': {'bold': True}})
+            sheet = self.spreadsheet.add_worksheet(
+                title='Главная', rows=200, cols=8
+            )
+            # Ставим лист первым
+            try:
+                all_sheets = self.spreadsheet.worksheets()
+                self.spreadsheet.reorder_worksheets(
+                    [sheet] + [ws for ws in all_sheets if ws.id != sheet.id]
+                )
+            except Exception:
+                pass
+
+            sheet.update('A1:G1', [self.DASHBOARD_HEADERS],
+                         value_input_option='USER_ENTERED')
+            sheet.format('A1:G1', {
+                'textFormat': {
+                    'bold': True,
+                    'foregroundColor': {'red': 1.0, 'green': 1.0, 'blue': 1.0}
+                },
+                'backgroundColor': {'red': 0.2, 'green': 0.47, 'blue': 0.78},
+                'horizontalAlignment': 'CENTER',
+            })
+
+            self.spreadsheet.batch_update({"requests": [
+                {"updateDimensionProperties": {
+                    "range": {"sheetId": sheet.id, "dimension": "COLUMNS",
+                              "startIndex": 0, "endIndex": 1},
+                    "properties": {"pixelSize": 180}, "fields": "pixelSize"
+                }},
+                {"updateDimensionProperties": {
+                    "range": {"sheetId": sheet.id, "dimension": "COLUMNS",
+                              "startIndex": 1, "endIndex": 7},
+                    "properties": {"pixelSize": 145}, "fields": "pixelSize"
+                }},
+            ]})
+            logger.info("Создан лист Главная")
             return sheet
 
     def update_balance_sheet(self, user_name: str):
-        """Обновляет строку сотрудника на листе Баланс"""
+        """
+        Добавляет/обновляет строку сотрудника на листе Главная.
+        Формулы ссылаются на L2..L7 листа сотрудника.
+        """
         try:
-            balance_sheet = self.get_or_create_balance_sheet()
-            all_vals = balance_sheet.col_values(1)
-            if user_name in all_vals:
-                row = all_vals.index(user_name) + 1
+            sheet = self.get_or_create_balance_sheet()
+            all_names = sheet.col_values(1)
+
+            if user_name in all_names:
+                row = all_names.index(user_name) + 1
             else:
-                row = len(all_vals) + 1
-                balance_sheet.update_cell(row, 1, user_name)
+                row = max(len(all_names) + 1, 2)
+
+            safe = user_name.replace("'", "''")
+            row_data = [
+                user_name,
+                f"='{safe}'!L2",   # Выдано
+                f"='{safe}'!L3",   # Принято расходов
+                f"='{safe}'!L4",   # В проверке
+                f"='{safe}'!L5",   # Компенсировано
+                f"='{safe}'!L6",   # Остаток
+                f"='{safe}'!L7",   # Реально на руках
+            ]
+            sheet.update(f'A{row}:G{row}', [row_data],
+                         value_input_option='USER_ENTERED')
+
+            bg = {'red': 0.9, 'green': 0.94, 'blue': 1.0} if row % 2 == 0 \
+                else {'red': 1.0, 'green': 1.0, 'blue': 1.0}
+            sheet.format(f'A{row}:G{row}', {'backgroundColor': bg})
+
+            logger.info(f"Дашборд обновлён: {user_name}, строка {row}")
         except Exception as e:
-            logger.error(f"Ошибка обновления баланса: {e}")
+            logger.error(f"Ошибка обновления дашборда: {e}")
+
+    # ─── ЛИСТ СОТРУДНИКА ─────────────────────────────────────────────────────
 
     def get_or_create_employee_sheet(self, user_name: str):
         try:
@@ -207,24 +252,20 @@ class GoogleSheetsManager:
                     title=user_name, rows=1000, cols=12
                 )
 
-                # Заголовки A1:I1
                 sheet.update('A1:I1', [SHEET_HEADERS])
                 sheet.format('A1:I1', {
                     'textFormat': {'bold': True},
                     'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
                 })
 
-                # Флажки G2:H1000 + высота строк + ширина столбца чека
                 self.spreadsheet.batch_update({
                     "requests": [
                         {
                             "repeatCell": {
                                 "range": {
                                     "sheetId": sheet.id,
-                                    "startRowIndex": 1,
-                                    "endRowIndex": 1000,
-                                    "startColumnIndex": 6,
-                                    "endColumnIndex": 8
+                                    "startRowIndex": 1, "endRowIndex": 1000,
+                                    "startColumnIndex": 6, "endColumnIndex": 8
                                 },
                                 "cell": {
                                     "dataValidation": {
@@ -240,8 +281,7 @@ class GoogleSheetsManager:
                                 "range": {
                                     "sheetId": sheet.id,
                                     "dimension": "ROWS",
-                                    "startIndex": 1,
-                                    "endIndex": 1000
+                                    "startIndex": 1, "endIndex": 1000
                                 },
                                 "properties": {"pixelSize": PHOTO_ROW_HEIGHT},
                                 "fields": "pixelSize"
@@ -252,8 +292,7 @@ class GoogleSheetsManager:
                                 "range": {
                                     "sheetId": sheet.id,
                                     "dimension": "COLUMNS",
-                                    "startIndex": 8,
-                                    "endIndex": 9
+                                    "startIndex": 8, "endIndex": 9
                                 },
                                 "properties": {"pixelSize": 200},
                                 "fields": "pixelSize"
@@ -262,7 +301,6 @@ class GoogleSheetsManager:
                     ]
                 })
 
-                # Баланс K1:L7
                 balance_data = [
                     ['Баланс', ''],
                     ['Выдано', '=SUMPRODUCT((A2:A1000="Выдано")*(H2:H1000<>TRUE)*C2:C1000)'],
@@ -305,11 +343,10 @@ class GoogleSheetsManager:
                 return False
 
             receipt_url = data.get('receipt_url', '')
-            # Прямая ссылка Google Drive работает в =IMAGE()
-            if receipt_url and 'drive.google.com' in receipt_url:
+            if receipt_url and 'yadi.sk' in receipt_url:
                 receipt_cell = f'=IMAGE("{receipt_url}",2)'
             else:
-                receipt_cell = receipt_url  # fallback: просто ссылка
+                receipt_cell = receipt_url
 
             row_data = [
                 'Расход',
@@ -329,6 +366,10 @@ class GoogleSheetsManager:
                 [row_data],
                 value_input_option='USER_ENTERED'
             )
+
+            # Обновляем дашборд после каждого расхода
+            self.update_balance_sheet(user_name)
+
             return True
         except Exception as e:
             logger.error(f"Ошибка добавления: {e}")
@@ -474,8 +515,7 @@ def format_balance(b: Dict) -> str:
 
 
 def get_confirm_text(d: Dict) -> str:
-    has_receipt = bool(d.get('receipt_url'))
-    receipt_status = "✅ Чек загружен" if has_receipt else "📸 Чек не загружен"
+    receipt_status = "✅ Чек на Яндекс Диске" if d.get('receipt_on_yandex') else "✅ Чек загружен"
     return (
         f"📋 <b>Проверьте данные:</b>\n\n"
         f"🏗 Направление: <b>{d.get('direction_name', '')}</b>\n"
@@ -808,19 +848,19 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
-    await update.message.reply_text("⏳ Загружаю чек на Google Drive...")
+    await update.message.reply_text("⏳ Загружаю чек на Яндекс Диск...")
 
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     user_name = full_name(update.effective_user)
 
     file_bytes = await file.download_as_bytearray()
-    filename = f"{user_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
+    yandex_url = upload_to_yandex_disk(bytes(file_bytes), filename, user_name)
 
-    drive_url = upload_to_google_drive(bytes(file_bytes), filename, user_name)
-
-    context.user_data['receipt_url'] = drive_url or file.file_path
+    context.user_data['receipt_url'] = yandex_url or file.file_path
     context.user_data['receipt_file_id'] = photo.file_id
+    context.user_data['receipt_on_yandex'] = yandex_url is not None
 
     return await show_confirm_msg(update.message, context)
 
