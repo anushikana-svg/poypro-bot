@@ -316,13 +316,12 @@ class GoogleSheetsManager:
             receipt_url = data.get('receipt_url', '')
             receipt_cell = f'=IMAGE("{receipt_url}",2)' if receipt_url and 'drive.google.com' in receipt_url else receipt_url
 
-            amount_val = data.get('amount', 0)  # float
-            amount_display = fmt_amount_str(amount_val)
+            amount_val = data.get('amount', 0)  # float — храним как число
 
             row_data = [
                 'Расход',
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
-                amount_display,
+                amount_val,
                 data.get('subproject', ''),
                 data.get('category', ''),
                 data.get('description', ''),
@@ -330,7 +329,8 @@ class GoogleSheetsManager:
                 False,
                 receipt_cell,
             ]
-            sheet.update(f'A{self._next_empty_row(sheet)}:I{self._next_empty_row(sheet)}',
+            next_row = self._next_empty_row(sheet)
+            sheet.update(f'A{next_row}:I{next_row}',
                          [row_data], value_input_option='USER_ENTERED')
             self.update_balance_sheet(user_name)
             return True
@@ -343,10 +343,13 @@ class GoogleSheetsManager:
             sheet = self.get_or_create_employee_sheet(user_name)
             if not sheet:
                 return False
-            amount_str = fmt_amount_str(amount)
             for row in sheet.get_all_values()[1:]:
-                if len(row) >= 6 and row[3] == subproject and row[4] == category and row[2] == amount_str:
-                    return True
+                if len(row) >= 6 and row[3] == subproject and row[4] == category:
+                    try:
+                        if float(str(row[2]).replace(' ', '').replace(',', '.')) == amount:
+                            return True
+                    except:
+                        pass
             return False
         except:
             return False
