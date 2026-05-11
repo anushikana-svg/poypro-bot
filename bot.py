@@ -129,24 +129,39 @@ def get_google_creds() -> Optional[Credentials]:
 
 # ─── Google Drive ─────────────────────────────────────────────────────────────
 
-async def get_telegram_file_url(bot, file_id: str) -> Optional[str]:
+async def upload_to_imgbb(bot, file_id: str) -> Optional[str]:
     """
-    Получает постоянную прямую ссылку на фото через Telegram Bot API.
-    Ссылка работает в =IMAGE() в Google Sheets пока действует токен бота.
+    Загружает фото на ImgBB и возвращает постоянную прямую ссылку.
+    Ссылка работает в =IMAGE() в Google Sheets.
     """
     try:
-        token = os.getenv('TELEGRAM_BOT_TOKEN')
+        import base64
+        import requests as req
+
+        # Скачиваем файл из Telegram
         file = await bot.get_file(file_id)
-        # file.file_path может быть как путём, так и полным URL
-        path = file.file_path
-        if path.startswith('http'):
-            url = path  # уже полный URL
+        file_bytes = await file.download_as_bytearray()
+
+        # Кодируем в base64 и загружаем на ImgBB
+        b64 = base64.b64encode(bytes(file_bytes)).decode('utf-8')
+        resp = req.post(
+            "https://api.imgbb.com/1/upload",
+            data={
+                "key": "5bc37cf490fddb21bb4721de6072bec7",
+                "image": b64,
+            },
+            timeout=30
+        )
+        data = resp.json()
+        if data.get("success"):
+            url = data["data"]["url"]
+            logger.info(f"ImgBB: загружено — {url}")
+            return url
         else:
-            url = f"https://api.telegram.org/file/bot{token}/{path}"
-        logger.info(f"Telegram file URL: {url}")
-        return url
+            logger.error(f"ImgBB ошибка: {data}")
+            return None
     except Exception as e:
-        logger.error(f"Telegram file URL ошибка: {e}")
+        logger.error(f"ImgBB ошибка: {e}")
         return None
 
 
@@ -719,12 +734,12 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Нужно отправить фото чека:")
         return RECEIPT
 
-    await update.message.reply_text("⏳ Получаю ссылку на чек...")
+    await update.message.reply_text("⏳ Загружаю чек...")
     photo = update.message.photo[-1]
 
-    tg_url = await get_telegram_file_url(context.bot, photo.file_id)
+    img_url = await upload_to_imgbb(context.bot, photo.file_id)
 
-    context.user_data['receipt_url'] = tg_url or ''
+    context.user_data['receipt_url'] = img_url or ''
     context.user_data['receipt_file_id'] = photo.file_id
     return await show_confirm_msg(update.message, context)
 
