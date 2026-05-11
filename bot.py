@@ -313,7 +313,7 @@ class GoogleSheetsManager:
                 return False
 
             receipt_url = data.get('receipt_url', '')
-            receipt_cell = f'=IMAGE("{receipt_url}",2)' if receipt_url else ''
+            receipt_cell = f'=IMAGE("{receipt_url}";2)' if receipt_url else ''
 
             amount_val = data.get('amount', 0)  # float — храним как число
 
