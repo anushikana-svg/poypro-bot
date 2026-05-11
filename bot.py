@@ -137,7 +137,12 @@ async def get_telegram_file_url(bot, file_id: str) -> Optional[str]:
     try:
         token = os.getenv('TELEGRAM_BOT_TOKEN')
         file = await bot.get_file(file_id)
-        url = f"https://api.telegram.org/file/bot{token}/{file.file_path}"
+        # file.file_path может быть как путём, так и полным URL
+        path = file.file_path
+        if path.startswith('http'):
+            url = path  # уже полный URL
+        else:
+            url = f"https://api.telegram.org/file/bot{token}/{path}"
         logger.info(f"Telegram file URL: {url}")
         return url
     except Exception as e:
