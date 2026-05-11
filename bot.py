@@ -62,7 +62,7 @@ SHEET_HEADERS = [
     'Статья расхода', 'Описание расхода', 'Расход принят', 'Закрыто', 'Чек'
 ]
 
-PHOTO_ROW_HEIGHT = 150
+PHOTO_ROW_HEIGHT = 375
 
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
@@ -129,40 +129,63 @@ def get_google_creds() -> Optional[Credentials]:
 
 # ─── Google Drive ─────────────────────────────────────────────────────────────
 
-async def upload_to_imgbb(bot, file_id: str) -> Optional[str]:
+async def upload_receipt(bot, file_id: str, filename: str, user_name: str) -> Optional[str]:
     """
-    Загружает фото на ImgBB и возвращает постоянную прямую ссылку.
-    Ссылка работает в =IMAGE() в Google Sheets.
+    Загружает фото:
+    - на ImgBB (для =IMAGE() в Google Sheets) — возвращает URL
+    - на Яндекс Диск (для архива) — параллельно, молча
     """
+    import base64
+    import requests as req
+
+    file = await bot.get_file(file_id)
+    file_bytes = bytes(await file.download_as_bytearray())
+
+    # ── ImgBB ────────────────────────────────────────────────────────────────
+    imgbb_url = None
     try:
-        import base64
-        import requests as req
-
-        # Скачиваем файл из Telegram
-        file = await bot.get_file(file_id)
-        file_bytes = await file.download_as_bytearray()
-
-        # Кодируем в base64 и загружаем на ImgBB
-        b64 = base64.b64encode(bytes(file_bytes)).decode('utf-8')
+        b64 = base64.b64encode(file_bytes).decode('utf-8')
         resp = req.post(
             "https://api.imgbb.com/1/upload",
-            data={
-                "key": "5bc37cf490fddb21bb4721de6072bec7",
-                "image": b64,
-            },
+            data={"key": "5bc37cf490fddb21bb4721de6072bec7", "image": b64},
             timeout=30
         )
         data = resp.json()
         if data.get("success"):
-            url = data["data"]["url"]
-            logger.info(f"ImgBB: загружено — {url}")
-            return url
+            imgbb_url = data["data"]["url"]
+            logger.info(f"ImgBB: загружено — {imgbb_url}")
         else:
             logger.error(f"ImgBB ошибка: {data}")
-            return None
     except Exception as e:
         logger.error(f"ImgBB ошибка: {e}")
-        return None
+
+    # ── Яндекс Диск (архив) ──────────────────────────────────────────────────
+    try:
+        token = os.getenv('YANDEX_DISK_TOKEN')
+        if token:
+            now = datetime.now()
+            folder = f"Чеки/{user_name}/{now.year}/{now.month:02d}"
+            for path in ["Чеки", f"Чеки/{user_name}",
+                         f"Чеки/{user_name}/{now.year}", folder]:
+                req.put(
+                    "https://cloud-api.yandex.net/v1/disk/resources",
+                    headers={"Authorization": f"OAuth {token}"},
+                    params={"path": path}, timeout=10
+                )
+            disk_path = f"{folder}/{filename}"
+            upload_resp = req.get(
+                "https://cloud-api.yandex.net/v1/disk/resources/upload",
+                headers={"Authorization": f"OAuth {token}"},
+                params={"path": disk_path, "overwrite": "true"}, timeout=10
+            )
+            upload_url = upload_resp.json().get("href")
+            if upload_url:
+                req.put(upload_url, data=file_bytes, timeout=30)
+                logger.info(f"Яндекс Диск: архивировано {disk_path}")
+    except Exception as e:
+        logger.error(f"Яндекс Диск ошибка: {e}")
+
+    return imgbb_url
 
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
@@ -281,7 +304,7 @@ class GoogleSheetsManager:
                         "updateDimensionProperties": {
                             "range": {"sheetId": sheet.id, "dimension": "COLUMNS",
                                       "startIndex": 8, "endIndex": 9},
-                            "properties": {"pixelSize": 200}, "fields": "pixelSize"
+                            "properties": {"pixelSize": 500}, "fields": "pixelSize"
                         }
                     },
                 ]})
@@ -365,7 +388,11 @@ class GoogleSheetsManager:
                 if len(row) < 8 or not row[0]:
                     continue
                 try:
-                    amount = float(str(row[2]).replace(' ', '').replace(',', '.'))
+                    val = row[2]
+                    if isinstance(val, (int, float)):
+                        amount = float(val)
+                    else:
+                        amount = float(str(val).replace(' ', '').replace(',', '.'))
                 except:
                     continue
 
@@ -736,8 +763,10 @@ async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await update.message.reply_text("⏳ Загружаю чек...")
     photo = update.message.photo[-1]
+    user_name = full_name(update.effective_user)
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{photo.file_id[-8:]}.jpg"
 
-    img_url = await upload_to_imgbb(context.bot, photo.file_id)
+    img_url = await upload_receipt(context.bot, photo.file_id, filename, user_name)
 
     context.user_data['receipt_url'] = img_url or ''
     context.user_data['receipt_file_id'] = photo.file_id
