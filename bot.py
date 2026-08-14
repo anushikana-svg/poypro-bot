@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 DIRECTIONS = ['СТ — Синий Трактор', 'ФШ — Фиксишоу']
 
-INCOME_SOURCES = ['Возврат депозита', 'Продажа в магазине', 'Другой доход налом']
+INCOME_SOURCES = ['Магазин', 'Другое']
 
 SUBTYPES = {
     'СТ': ['Гастроль', 'Франшиза', 'Проект', 'Склад'],
@@ -517,7 +517,7 @@ def make_category_keyboard() -> InlineKeyboardMarkup:
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить расход", callback_data="menu_add")],
-        [InlineKeyboardButton("💵 Взнос", callback_data="menu_income")],
+        [InlineKeyboardButton("💵 Внести деньги", callback_data="menu_income")],
         [InlineKeyboardButton("💰 Остаток", callback_data="menu_balance")],
         [InlineKeyboardButton("📋 Мои расходы", callback_data="menu_myexpenses")],
     ])
@@ -589,7 +589,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "menu_income":
         context.user_data.clear()
         await query.edit_message_text(
-            "💵 <b>Взнос</b>\n\nВыберите источник:",
+            "💵 <b>Внести деньги</b>\n\nВыберите источник:",
             reply_markup=make_keyboard(INCOME_SOURCES, cols=1),
             parse_mode=ParseMode.HTML
         )
