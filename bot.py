@@ -36,13 +36,15 @@ logger = logging.getLogger(__name__)
 
 (MENU, DIRECTION, SUBTYPE, SUBPROJECT, GASTROL_CHOOSE, GASTROL_DATE,
  GASTROL_YEAR, GASTROL_CITY, CATEGORY, AMOUNT, DESCRIPTION,
- RECEIPT, CONFIRM, EDIT_CHOICE) = range(14)
+ RECEIPT, CONFIRM, EDIT_CHOICE, INCOME_SOURCE, INCOME_AMOUNT, INCOME_DESC) = range(17)
 
 DIRECTIONS = ['СТ — Синий Трактор', 'ФШ — Фиксишоу']
 
+INCOME_SOURCES = ['Возврат депозита', 'Продажа в магазине', 'Другой доход налом']
+
 SUBTYPES = {
-    'СТ': ['Гастроль', 'Франшиза', 'Проект'],
-    'ФШ': ['Гастроль', 'Проект'],
+    'СТ': ['Гастроль', 'Франшиза', 'Проект', 'Склад'],
+    'ФШ': ['Гастроль', 'Проект', 'Склад'],
 }
 
 CATEGORIES = [
@@ -51,6 +53,8 @@ CATEGORIES = [
     'Изготовление и ремонт реквизита',
     'Доставка',
     'Такси',
+    'Бензин',
+    'Залог',
     'Аренда зала',
     'Другое',
 ]
@@ -214,12 +218,22 @@ class GoogleSheetsManager:
     # ── Главная ──────────────────────────────────────────────────────────────
 
     DASHBOARD_HEADERS = [
-        'Сотрудник', 'Выдано', 'Принято расходов', 'В проверке', 'Остаток', 'Реально на руках'
+        'Сотрудник', 'Выдано', 'Принято расходов', 'В проверке', 'Взносы', 'Остаток', 'Реально на руках'
     ]
 
     def get_or_create_balance_sheet(self):
         try:
-            return self.spreadsheet.worksheet('Главная')
+            sheet = self.spreadsheet.worksheet('Главная')
+            # Самолечение: если лист создан до появления колонки "Взносы" — доводим шапку до актуальной
+            header = sheet.row_values(1)
+            if header[:len(self.DASHBOARD_HEADERS)] != self.DASHBOARD_HEADERS:
+                sheet.update('A1:G1', [self.DASHBOARD_HEADERS], value_input_option='USER_ENTERED')
+                sheet.format('A1:G1', {
+                    'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+                    'backgroundColor': {'red': 0.2, 'green': 0.47, 'blue': 0.78},
+                    'horizontalAlignment': 'CENTER',
+                })
+            return sheet
         except WorksheetNotFound:
             sheet = self.spreadsheet.add_worksheet(title='Главная', rows=200, cols=7)
             try:
@@ -230,8 +244,8 @@ class GoogleSheetsManager:
             except Exception:
                 pass
 
-            sheet.update('A1:F1', [self.DASHBOARD_HEADERS], value_input_option='USER_ENTERED')
-            sheet.format('A1:F1', {
+            sheet.update('A1:G1', [self.DASHBOARD_HEADERS], value_input_option='USER_ENTERED')
+            sheet.format('A1:G1', {
                 'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
                 'backgroundColor': {'red': 0.2, 'green': 0.47, 'blue': 0.78},
                 'horizontalAlignment': 'CENTER',
@@ -242,7 +256,7 @@ class GoogleSheetsManager:
                     "properties": {"pixelSize": 180}, "fields": "pixelSize"
                 }},
                 {"updateDimensionProperties": {
-                    "range": {"sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 6},
+                    "range": {"sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 7},
                     "properties": {"pixelSize": 150}, "fields": "pixelSize"
                 }},
             ]})
@@ -261,14 +275,15 @@ class GoogleSheetsManager:
             issued   = f"=SUMPRODUCT((LOWER('{s}'!A2:A1000)=\"выдано\")*(('{s}'!H2:H1000)<>TRUE)*('{s}'!C2:C1000))"
             accepted = f"=SUMPRODUCT((LOWER('{s}'!A2:A1000)=\"расход\")*('{s}'!G2:G1000=TRUE)*(('{s}'!H2:H1000)<>TRUE)*('{s}'!C2:C1000))"
             pending  = f"=SUMPRODUCT((LOWER('{s}'!A2:A1000)=\"расход\")*('{s}'!G2:G1000<>TRUE)*(('{s}'!H2:H1000)<>TRUE)*('{s}'!C2:C1000))"
-            balance  = f"=B{row}-C{row}"
-            real     = f"=B{row}-C{row}-D{row}"
+            income   = f"=SUMPRODUCT((LOWER('{s}'!A2:A1000)=\"взнос\")*(('{s}'!H2:H1000)<>TRUE)*('{s}'!C2:C1000))"
+            balance  = f"=B{row}-C{row}+E{row}"
+            real     = f"=B{row}-C{row}-D{row}+E{row}"
 
-            sheet.update(f'A{row}:F{row}', [[user_name, issued, accepted, pending, balance, real]],
+            sheet.update(f'A{row}:G{row}', [[user_name, issued, accepted, pending, income, balance, real]],
                          value_input_option='USER_ENTERED')
 
             bg = {'red': 0.9, 'green': 0.94, 'blue': 1.0} if row % 2 == 0 else {'red': 1, 'green': 1, 'blue': 1}
-            sheet.format(f'A{row}:F{row}', {'backgroundColor': bg})
+            sheet.format(f'A{row}:G{row}', {'backgroundColor': bg})
         except Exception as e:
             logger.error(f"Ошибка дашборда: {e}")
 
@@ -365,6 +380,34 @@ class GoogleSheetsManager:
             logger.error(f"Ошибка добавления: {e}")
             return False
 
+    def add_income(self, user_name: str, data: Dict) -> bool:
+        """Взнос: возврат депозита, выручка с продаж, другой доход налом — увеличивает остаток"""
+        try:
+            sheet = self.get_or_create_employee_sheet(user_name)
+            if not sheet:
+                return False
+
+            row_data = [
+                'Взнос',
+                datetime.now().strftime("%d.%m.%Y %H:%M"),
+                data.get('amount', 0),
+                '',
+                data.get('source', ''),
+                data.get('description', ''),
+                False,
+                False,
+                '', '', '',
+            ]
+
+            next_row = self._next_empty_row(sheet)
+            sheet.update(f'A{next_row}:K{next_row}',
+                         [row_data], value_input_option='USER_ENTERED')
+            self.update_balance_sheet(user_name)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка взноса: {e}")
+            return False
+
     def check_duplicate(self, user_name: str, subproject: str, category: str, amount: float) -> bool:
         try:
             sheet = self.get_or_create_employee_sheet(user_name)
@@ -387,7 +430,7 @@ class GoogleSheetsManager:
             if not sheet:
                 return self._empty_balance()
 
-            issued = accepted = pending = 0.0
+            issued = accepted = pending = income = 0.0
 
             for row in sheet.get_all_values()[1:]:
                 if len(row) < 8 or not row[0]:
@@ -414,20 +457,23 @@ class GoogleSheetsManager:
                         accepted += amount
                     else:
                         pending += amount
+                elif rtype == 'взнос':
+                    income += amount
 
             return {
                 'issued': issued,
                 'accepted': accepted,
                 'pending': pending,
-                'balance': issued - accepted,
-                'real_balance': issued - accepted - pending,
+                'income': income,
+                'balance': issued - accepted + income,
+                'real_balance': issued - accepted - pending + income,
             }
         except Exception as e:
             logger.error(f"Баланс ошибка: {e}")
             return self._empty_balance()
 
     def _empty_balance(self):
-        return {'issued': 0, 'accepted': 0, 'pending': 0, 'balance': 0, 'real_balance': 0}
+        return {'issued': 0, 'accepted': 0, 'pending': 0, 'income': 0, 'balance': 0, 'real_balance': 0}
 
     def get_my_expenses(self, user_name: str) -> List[Dict]:
         try:
@@ -436,13 +482,18 @@ class GoogleSheetsManager:
                 return []
             result = []
             for row in sheet.get_all_values()[1:]:
-                if len(row) >= 5 and row[0].lower() == 'расход':
-                    accepted = str(row[6]).upper() in ('TRUE', 'ИСТИНА', '1') if len(row) > 6 else False
+                if len(row) >= 5 and row[0].strip().lower() in ('расход', 'взнос'):
+                    rtype = row[0].strip().lower()
+                    if rtype == 'расход':
+                        accepted = str(row[6]).upper() in ('TRUE', 'ИСТИНА', '1') if len(row) > 6 else False
+                        status = '✅ Принят' if accepted else '🔍 В проверке'
+                    else:
+                        status = '💵 Взнос'
                     result.append({
                         'date': row[1],
                         'amount': row[2],
                         'category': row[4],
-                        'status': '✅ Принят' if accepted else '🔍 В проверке',
+                        'status': status,
                     })
             return result[-20:]
         except:
@@ -466,6 +517,7 @@ def make_category_keyboard() -> InlineKeyboardMarkup:
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить расход", callback_data="menu_add")],
+        [InlineKeyboardButton("💵 Взнос", callback_data="menu_income")],
         [InlineKeyboardButton("💰 Остаток", callback_data="menu_balance")],
         [InlineKeyboardButton("📋 Мои расходы", callback_data="menu_myexpenses")],
     ])
@@ -477,6 +529,7 @@ def format_balance(b: Dict) -> str:
         f"Выдано: <b>{fmt_money(b['issued'])}</b>\n\n"
         f"✅ Принято расходов: <b>{fmt_money(b['accepted'])}</b>\n"
         f"🔍 В проверке: <b>{fmt_money(b['pending'])}</b>\n"
+        f"💵 Взносы: <b>{fmt_money(b.get('income', 0))}</b>\n"
         f"─────────────────\n"
         f"Остаток: <b>{fmt_money(b['balance'])}</b>\n"
         f"Реально на руках: <b>{fmt_money(b['real_balance'])}</b>"
@@ -532,6 +585,15 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         return DIRECTION
+
+    elif query.data == "menu_income":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "💵 <b>Взнос</b>\n\nВыберите источник:",
+            reply_markup=make_keyboard(INCOME_SOURCES, cols=1),
+            parse_mode=ParseMode.HTML
+        )
+        return INCOME_SOURCE
 
     elif query.data == "menu_balance":
         gs = GoogleSheetsManager()
@@ -609,6 +671,15 @@ async def subtype_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data['subproject'] = 'Франшиза'
         await query.edit_message_text(
             f"✅ Гастроль/Проект: <b>Франшиза</b>\n\n🏷 Выберите статью расхода:",
+            reply_markup=make_category_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return CATEGORY
+
+    elif subtype == 'Склад':
+        context.user_data['subproject'] = 'Склад'
+        await query.edit_message_text(
+            f"✅ Гастроль/Проект: <b>Склад</b>\n\n🏷 Выберите статью расхода:",
             reply_markup=make_category_keyboard(),
             parse_mode=ParseMode.HTML
         )
@@ -763,6 +834,83 @@ async def description_received(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode=ParseMode.HTML
     )
     return RECEIPT
+
+
+async def income_source_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['income_source'] = query.data
+    await query.edit_message_text(
+        f"✅ Источник: <b>{query.data}</b>\n\n💰 Введите сумму (например <b>3000</b>):",
+        parse_mode=ParseMode.HTML
+    )
+    return INCOME_AMOUNT
+
+
+async def income_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    amount_val = format_amount(update.message.text)
+    if not amount_val:
+        await update.message.reply_text(
+            "❌ Неверный формат. Введите сумму, например <b>3000</b>:",
+            parse_mode=ParseMode.HTML
+        )
+        return INCOME_AMOUNT
+    context.user_data['income_amount'] = amount_val
+    await update.message.reply_text(
+        "📝 Короткий комментарий (например «Баллон газа» или «Продажа футболок на площадке»):"
+    )
+    return INCOME_DESC
+
+
+async def income_desc_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("❌ Напишите комментарий:")
+        return INCOME_DESC
+
+    user_name = full_name(update.effective_user)
+    source = context.user_data.get('income_source', '')
+    amount_val = context.user_data.get('income_amount', 0)
+
+    gs = GoogleSheetsManager()
+    ok = gs.add_income(user_name, {
+        'source': source,
+        'amount': amount_val,
+        'description': text,
+    })
+
+    if ok:
+        await update.message.reply_text(
+            f"✅ <b>Взнос сохранён!</b>\n\n"
+            f"Источник: {source}\n"
+            f"Сумма: {fmt_money(amount_val)}\n"
+            f"📝 {text}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+        admin_id = int(os.getenv('ADMIN_CHAT_ID', 0))
+        if admin_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        f"💵 <b>Новый взнос</b>\n\n"
+                        f"👤 {user_name}\n"
+                        f"📌 {source}\n"
+                        f"💰 {fmt_money(amount_val)}\n"
+                        f"📝 {text}\n"
+                        f"⏰ {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить админа: {e}")
+    else:
+        await update.message.reply_text(
+            "❌ Ошибка сохранения. Попробуйте ещё раз.",
+            reply_markup=main_menu_keyboard()
+        )
+    return MENU
 
 
 async def receipt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1003,6 +1151,9 @@ def main():
             ],
             CONFIRM: [CallbackQueryHandler(confirm_handler, pattern='^confirm_')],
             EDIT_CHOICE: [CallbackQueryHandler(edit_choice_handler, pattern='^edit_')],
+            INCOME_SOURCE: [CallbackQueryHandler(income_source_selected)],
+            INCOME_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, income_amount_received)],
+            INCOME_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, income_desc_received)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
         allow_reentry=True,
