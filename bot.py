@@ -52,13 +52,14 @@ CATEGORIES = [
     'Доставка',
     'Такси',
     'Аренда зала',
-    'Другое',
+    'Склад',
+    'Франшиза',
 ]
 
 CAT_CODES = {f'cat_{i}': cat for i, cat in enumerate(CATEGORIES)}
 
 SHEET_HEADERS = [
-    'Тип', 'Дата', 'Сумма', 'Гастроль/Проект',
+    'Тип', 'Дата', 'Сумма', 'Направление',
     'Статья расхода', 'Описание расхода', 'Расход принят', 'Закрыто',
     'Чек 1', 'Чек 2', 'Чек 3'
 ]
@@ -436,22 +437,32 @@ class GoogleSheetsManager:
         return {'issued': 0, 'accepted': 0, 'pending': 0, 'balance': 0, 'real_balance': 0}
 
     def get_my_expenses(self, user_name: str) -> List[Dict]:
+        """Незакрытые расходы сотрудника (новые — внизу списка)"""
         try:
             sheet = self.get_or_create_employee_sheet(user_name)
             if not sheet:
                 return []
             result = []
             for row in sheet.get_all_values()[1:]:
-                if len(row) >= 5 and row[0].lower() == 'расход':
-                    accepted = str(row[6]).upper() in ('TRUE', 'ИСТИНА', '1') if len(row) > 6 else False
-                    result.append({
-                        'date': row[1],
-                        'amount': row[2],
-                        'category': row[4],
-                        'status': '✅ Принят' if accepted else '🔍 В проверке',
-                    })
-            return result[-20:]
-        except:
+                if len(row) < 5 or row[0].strip().lower() != 'расход':
+                    continue
+                if len(row) > 7 and str(row[7]).upper() in ('TRUE', 'ИСТИНА', '1'):
+                    continue  # закрыто
+                try:
+                    amount = float(str(row[2]).replace(' ', '').replace(',', '.'))
+                except:
+                    amount = 0.0
+                accepted = len(row) > 6 and str(row[6]).upper() in ('TRUE', 'ИСТИНА', '1')
+                result.append({
+                    'date': row[1][:10],
+                    'amount': amount,
+                    'project': row[3],
+                    'category': row[4],
+                    'accepted': accepted,
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Мои расходы ошибка: {e}")
             return []
 
 
@@ -480,13 +491,42 @@ def main_menu_keyboard():
 def format_balance(b: Dict) -> str:
     return (
         f"💰 <b>Ваш баланс</b>\n\n"
-        f"Выдано: <b>{fmt_money(b['issued'])}</b>\n\n"
-        f"✅ Принято расходов: <b>{fmt_money(b['accepted'])}</b>\n"
-        f"🔍 В проверке: <b>{fmt_money(b['pending'])}</b>\n"
+        f"👛 На руках сейчас: <b>{fmt_money(b['real_balance'])}</b>\n"
+        f"<i>(выдано минус все отчёты, и принятые, и в проверке)</i>\n\n"
         f"─────────────────\n"
-        f"Остаток: <b>{fmt_money(b['balance'])}</b>\n"
-        f"Реально на руках: <b>{fmt_money(b['real_balance'])}</b>"
+        f"Выдано: {fmt_money(b['issued'])}\n"
+        f"✅ Принято: {fmt_money(b['accepted'])}\n"
+        f"🔍 В проверке: {fmt_money(b['pending'])}\n"
+        f"Остаток по принятым: {fmt_money(b['balance'])}"
     )
+
+
+def format_expenses(expenses: List[Dict]) -> str:
+    """Расходы двумя блоками: сначала в проверке, затем принятые"""
+    from html import escape
+    if not expenses:
+        return "📋 <b>Мои расходы</b>\n\nОткрытых расходов нет."
+
+    def line(e):
+        d = e['date'][:5]  # ДД.ММ
+        proj = escape(e['project'] or '—')
+        cat = escape(e['category'] or '—')
+        return f"{d} · {fmt_money(e['amount'])}\n      {cat} · {proj}"
+
+    pending = [e for e in expenses if not e['accepted']][-15:]
+    accepted = [e for e in expenses if e['accepted']][-10:]
+    all_pending = sum(e['amount'] for e in expenses if not e['accepted'])
+    all_accepted = sum(e['amount'] for e in expenses if e['accepted'])
+
+    parts = ["📋 <b>Мои расходы</b>"]
+    if pending:
+        parts.append(f"\n🔍 <b>В проверке — {fmt_money(all_pending)}</b>")
+        parts += [line(e) for e in pending]
+    if accepted:
+        parts.append(f"\n✅ <b>Принято — {fmt_money(all_accepted)}</b>")
+        parts += [line(e) for e in accepted]
+    parts.append("\n<i>Показаны последние записи. Закрытые периоды не отображаются.</i>")
+    return "\n".join(parts)
 
 
 def get_confirm_text(d: Dict) -> str:
@@ -498,7 +538,6 @@ def get_confirm_text(d: Dict) -> str:
     return (
         f"📋 <b>Проверьте данные:</b>\n\n"
         f"🏗 Направление: <b>{d.get('direction_name', '')}</b>\n"
-        f"📌 Гастроль/Проект: <b>{d.get('subproject', '')}</b>\n"
         f"🏷 Статья расхода: <b>{d.get('category', '')}</b>\n"
         f"💰 Сумма: <b>{amount_display}</b>\n"
         f"📝 Описание расхода: <b>{d.get('description', '')}</b>\n"
@@ -552,13 +591,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "menu_myexpenses":
         gs = GoogleSheetsManager()
         expenses = gs.get_my_expenses(full_name(update.effective_user))
-        if not expenses:
-            text = "📋 <b>Мои расходы</b>\n\nРасходов пока нет."
-        else:
-            lines = ["📋 <b>Мои расходы (последние 20)</b>\n"]
-            for e in expenses:
-                lines.append(f"{e['status']} {e['date'][:10]} | {e['amount']} ₽ | {e['category']}")
-            text = "\n".join(lines)
+        text = format_expenses(expenses)
         await query.edit_message_text(
             text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Меню", callback_data="back_menu")]]),
@@ -578,12 +611,13 @@ async def direction_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.clear()
     context.user_data['direction_code'] = code
     context.user_data['direction_name'] = 'Синий Трактор' if code == 'СТ' else 'Фиксишоу'
+    context.user_data['subproject'] = code  # в таблицу (колонка D) пишем направление
     await query.edit_message_text(
-        f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n\n📌 Выберите тип:",
-        reply_markup=make_keyboard(SUBTYPES[code], cols=1),
+        f"✅ Направление: <b>{context.user_data['direction_name']}</b>\n\n🏷 Выберите статью расхода:",
+        reply_markup=make_category_keyboard(),
         parse_mode=ParseMode.HTML
     )
-    return SUBTYPE
+    return CATEGORY
 
 
 async def subtype_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -860,13 +894,13 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return MENU
 
     if query.data == 'confirm_edit':
-        await query.edit_message_text("✏️ Что хотите изменить?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📌 Гастроль/Проект", callback_data="edit_subproject")],
+        edit_rows = [
             [InlineKeyboardButton("🏷 Статья расхода", callback_data="edit_category")],
             [InlineKeyboardButton("💰 Сумма", callback_data="edit_amount")],
             [InlineKeyboardButton("📝 Описание расхода", callback_data="edit_description")],
             [InlineKeyboardButton("📸 Чек", callback_data="edit_receipt")],
-        ]))
+        ]
+        await query.edit_message_text("✏️ Что хотите изменить?", reply_markup=InlineKeyboardMarkup(edit_rows))
         return EDIT_CHOICE
 
     if query.data == 'confirm_yes':
@@ -884,7 +918,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if ok:
             await query.edit_message_text(
                 f"✅ <b>Расход сохранён!</b>\n\n"
-                f"Гастроль/Проект: {d['subproject']}\n"
+                f"Направление: {d.get('direction_name', '')}\n"
                 f"Сумма: {fmt_money(d.get('amount', 0))}\n"
                 f"Статус: 🔍 В проверке",
                 parse_mode=ParseMode.HTML
@@ -895,7 +929,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     caption = (
                         f"📊 <b>Новый расход</b>\n\n"
                         f"👤 {user_name}\n"
-                        f"🏗 {d.get('direction_name')} / {d['subproject']}\n"
+                        f"🏗 {d.get('direction_name')}\n"
                         f"🏷 {d['category']}\n"
                         f"💰 {fmt_money(d.get('amount', 0))}\n"
                         f"📝 {d['description']}\n"
