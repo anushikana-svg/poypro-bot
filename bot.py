@@ -5,6 +5,7 @@ Expense Tracker Bot для Telegram
 """
 
 import os
+import asyncio
 import logging
 import json
 from datetime import datetime
@@ -61,8 +62,15 @@ CAT_CODES = {f'cat_{i}': cat for i, cat in enumerate(CATEGORIES)}
 SHEET_HEADERS = [
     'Тип', 'Дата', 'Сумма', 'Направление',
     'Статья расхода', 'Описание расхода', 'Расход принят', 'Закрыто',
-    'Чек 1', 'Чек 2', 'Чек 3'
+    'Чек 1', 'Чек 2', 'Чек 3',
+    'Вернуть на доработку', 'Комментарий', 'Статус возврата'
 ]
+RETURN_COLS = 14  # A..N
+SERVICE_SHEETS = {'Главная', 'Справочники', 'Сотрудники'}
+EMPLOYEES_SHEET = 'Сотрудники'
+
+# Telegram-ID, которые уже записаны в таблицу (чтобы не писать каждый раз)
+_known_ids: Dict[str, int] = {}
 MAX_PHOTOS = 3
 
 PHOTO_ROW_HEIGHT = 375
@@ -215,7 +223,7 @@ class GoogleSheetsManager:
     # ── Главная ──────────────────────────────────────────────────────────────
 
     DASHBOARD_HEADERS = [
-        'Сотрудник', 'Выдано', 'Принято расходов', 'В проверке', 'Остаток', 'Реально на руках'
+        'Сотрудник', 'Выдано', 'Принято расходов', 'В проверке', 'К отчету', 'Реально на руках'
     ]
 
     def get_or_create_balance_sheet(self):
@@ -254,6 +262,7 @@ class GoogleSheetsManager:
         """Строка сотрудника на Главной с SUMPRODUCT-формулами из его листа"""
         try:
             sheet = self.get_or_create_balance_sheet()
+            sheet.update('A1:F1', [self.DASHBOARD_HEADERS], value_input_option='USER_ENTERED')
             all_names = sheet.col_values(1)
 
             row = all_names.index(user_name) + 1 if user_name in all_names else max(len(all_names) + 1, 2)
@@ -262,8 +271,8 @@ class GoogleSheetsManager:
             issued   = f"=SUMPRODUCT((LOWER('{s}'!A2:A1000)=\"выдано\")*(('{s}'!H2:H1000)<>TRUE)*('{s}'!C2:C1000))"
             accepted = f"=SUMPRODUCT((LOWER('{s}'!A2:A1000)=\"расход\")*('{s}'!G2:G1000=TRUE)*(('{s}'!H2:H1000)<>TRUE)*('{s}'!C2:C1000))"
             pending  = f"=SUMPRODUCT((LOWER('{s}'!A2:A1000)=\"расход\")*('{s}'!G2:G1000<>TRUE)*(('{s}'!H2:H1000)<>TRUE)*('{s}'!C2:C1000))"
-            balance  = f"=B{row}-C{row}"
-            real     = f"=B{row}-C{row}-D{row}"
+            balance  = f"=B{row}-C{row}"          # К отчету = Выдано − Принято
+            real     = f"=B{row}-C{row}-D{row}"   # Реально на руках = К отчету − В проверке
 
             sheet.update(f'A{row}:F{row}', [[user_name, issued, accepted, pending, balance, real]],
                          value_input_option='USER_ENTERED')
@@ -283,9 +292,9 @@ class GoogleSheetsManager:
             try:
                 return self.spreadsheet.worksheet(user_name)
             except WorksheetNotFound:
-                sheet = self.spreadsheet.add_worksheet(title=user_name, rows=1000, cols=12)
-                sheet.update('A1:K1', [SHEET_HEADERS])
-                sheet.format('A1:I1', {
+                sheet = self.spreadsheet.add_worksheet(title=user_name, rows=1000, cols=RETURN_COLS)
+                sheet.update('A1:N1', [SHEET_HEADERS])
+                sheet.format('A1:N1', {
                     'textFormat': {'bold': True},
                     'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
                 })
@@ -295,6 +304,15 @@ class GoogleSheetsManager:
                             "range": {"sheetId": sheet.id,
                                       "startRowIndex": 1, "endRowIndex": 1000,
                                       "startColumnIndex": 6, "endColumnIndex": 8},
+                            "cell": {"dataValidation": {"condition": {"type": "BOOLEAN"}, "strict": True}},
+                            "fields": "dataValidation"
+                        }
+                    },
+                    {   # Флажок L «Вернуть на доработку»
+                        "repeatCell": {
+                            "range": {"sheetId": sheet.id,
+                                      "startRowIndex": 1, "endRowIndex": 1000,
+                                      "startColumnIndex": 11, "endColumnIndex": 12},
                             "cell": {"dataValidation": {"condition": {"type": "BOOLEAN"}, "strict": True}},
                             "fields": "dataValidation"
                         }
@@ -319,6 +337,106 @@ class GoogleSheetsManager:
         except Exception as e:
             logger.error(f"Ошибка листа: {e}")
             return None
+
+    # ── Возврат на доработку ─────────────────────────────────────────────────
+
+    def ensure_return_columns(self, sheet):
+        """Добавляет в уже существующий лист колонки L-N и флажок в L"""
+        try:
+            if sheet.col_count < RETURN_COLS:
+                sheet.add_cols(RETURN_COLS - sheet.col_count)
+            sheet.update('L1:N1', [SHEET_HEADERS[11:14]])
+            sheet.format('L1:N1', {
+                'textFormat': {'bold': True},
+                'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
+            })
+            self.spreadsheet.batch_update({"requests": [{
+                "repeatCell": {
+                    "range": {"sheetId": sheet.id,
+                              "startRowIndex": 1, "endRowIndex": 1000,
+                              "startColumnIndex": 11, "endColumnIndex": 12},
+                    "cell": {"dataValidation": {"condition": {"type": "BOOLEAN"}, "strict": True}},
+                    "fields": "dataValidation"
+                }
+            }]})
+            logger.info(f"Добавлены колонки возврата на лист {sheet.title}")
+        except Exception as e:
+            logger.error(f"Колонки возврата ошибка: {e}")
+
+    def _employees_sheet(self):
+        try:
+            return self.spreadsheet.worksheet(EMPLOYEES_SHEET)
+        except WorksheetNotFound:
+            sheet = self.spreadsheet.add_worksheet(title=EMPLOYEES_SHEET, rows=200, cols=2)
+            sheet.update('A1:B1', [['Сотрудник', 'Telegram ID']])
+            sheet.format('A1:B1', {'textFormat': {'bold': True}})
+            return sheet
+
+    def register_employee(self, name: str, chat_id: int):
+        """Запоминает Telegram-ID сотрудника, чтобы бот мог ему написать"""
+        try:
+            if not self.spreadsheet or not name:
+                return
+            sheet = self._employees_sheet()
+            names = sheet.col_values(1)
+            if name in names:
+                row = names.index(name) + 1
+                sheet.update(f'B{row}', [[chat_id]])
+            else:
+                sheet.update(f'A{len(names) + 1}:B{len(names) + 1}', [[name, chat_id]])
+            _known_ids[name] = chat_id
+        except Exception as e:
+            logger.error(f"Регистрация сотрудника ошибка: {e}")
+
+    def get_employee_ids(self) -> Dict[str, int]:
+        ids = {}
+        try:
+            for row in self._employees_sheet().get_all_values()[1:]:
+                if len(row) >= 2 and row[0] and str(row[1]).strip().lstrip('-').isdigit():
+                    ids[row[0]] = int(row[1])
+        except Exception as e:
+            logger.error(f"Список сотрудников ошибка: {e}")
+        return ids
+
+    def collect_returns(self) -> List[Dict]:
+        """Строки с флажком «Вернуть на доработку», по которым ещё не отправлено"""
+        result = []
+        if not self.spreadsheet:
+            return result
+        ids = None
+        for ws in self.spreadsheet.worksheets():
+            if ws.title in SERVICE_SHEETS:
+                continue
+            rows = ws.get_all_values()
+            if not rows or len(rows[0]) < 3 or rows[0][0] != 'Тип' or rows[0][2] != 'Сумма':
+                continue  # не лист сотрудника
+            if ws.col_count < RETURN_COLS:
+                self.ensure_return_columns(ws)
+                continue
+            for idx, row in enumerate(rows[1:], start=2):
+                if len(row) < 12 or str(row[11]).upper() not in ('TRUE', 'ИСТИНА'):
+                    continue
+                status = row[13] if len(row) > 13 else ''
+                if status and not status.startswith('⚠️'):
+                    continue  # уже отправлено
+                if ids is None:
+                    ids = self.get_employee_ids()
+                result.append({
+                    'ws': ws, 'row': idx, 'name': ws.title,
+                    'chat_id': ids.get(ws.title),
+                    'date': row[1][:10], 'amount': row[2],
+                    'category': row[4] if len(row) > 4 else '',
+                    'comment': row[12] if len(row) > 12 else '',
+                })
+        return result
+
+    def set_return_status(self, ws, row: int, text: str, close: bool = False):
+        try:
+            ws.update(f'N{row}', [[text]])
+            if close:
+                ws.update(f'H{row}', [[True]])  # старая строка закрыта, чтобы не учитывалась дважды
+        except Exception as e:
+            logger.error(f"Статус возврата ошибка: {e}")
 
     def _next_empty_row(self, sheet) -> int:
         return len(sheet.col_values(1)) + 1
@@ -349,6 +467,9 @@ class GoogleSheetsManager:
 
             amount_val = data.get('amount', 0)
 
+            if sheet.col_count < RETURN_COLS:
+                self.ensure_return_columns(sheet)
+
             row_data = [
                 'Расход',
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
@@ -358,10 +479,10 @@ class GoogleSheetsManager:
                 data.get('description', ''),
                 False,
                 False,
-            ] + receipt_cells  # Чек 1, Чек 2, Чек 3
+            ] + receipt_cells + [False, '', '']  # Чек 1-3, Вернуть, Комментарий, Статус
 
             next_row = self._next_empty_row(sheet)
-            sheet.update(f'A{next_row}:K{next_row}',
+            sheet.update(f'A{next_row}:N{next_row}',
                          [row_data], value_input_option='USER_ENTERED')
             self.update_balance_sheet(user_name)
             return True
@@ -480,12 +601,26 @@ def make_category_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
+def is_admin(update: Optional[Update]) -> bool:
+    try:
+        admin_id = int(os.getenv('ADMIN_CHAT_ID', 0))
+        if not admin_id or update is None:
+            return False
+        user, chat = update.effective_user, update.effective_chat
+        return (user is not None and user.id == admin_id) or (chat is not None and chat.id == admin_id)
+    except Exception:
+        return False
+
+
+def main_menu_keyboard(update: Optional[Update] = None):
+    rows = [
         [InlineKeyboardButton("➕ Добавить расход", callback_data="menu_add")],
         [InlineKeyboardButton("💰 Остаток", callback_data="menu_balance")],
         [InlineKeyboardButton("📋 Мои расходы", callback_data="menu_myexpenses")],
-    ])
+    ]
+    if is_admin(update):
+        rows.append([InlineKeyboardButton("✅ Проверены расходы", callback_data="menu_checked")])
+    return InlineKeyboardMarkup(rows)
 
 
 def format_balance(b: Dict) -> str:
@@ -497,7 +632,7 @@ def format_balance(b: Dict) -> str:
         f"Выдано: {fmt_money(b['issued'])}\n"
         f"✅ Принято: {fmt_money(b['accepted'])}\n"
         f"🔍 В проверке: {fmt_money(b['pending'])}\n"
-        f"Остаток по принятым: {fmt_money(b['balance'])}"
+        f"К отчёту (выдано − принято): {fmt_money(b['balance'])}"
     )
 
 
@@ -557,10 +692,76 @@ def confirm_keyboard():
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
 
+def register_user(update: Update):
+    """Записывает Telegram-ID сотрудника в таблицу (один раз)"""
+    try:
+        user, chat = update.effective_user, update.effective_chat
+        if not user or not chat:
+            return
+        name = full_name(user)
+        if _known_ids.get(name) == chat.id:
+            return
+        GoogleSheetsManager().register_employee(name, chat.id)
+    except Exception as e:
+        logger.error(f"register_user: {e}")
+
+
+def return_message(it: Dict) -> str:
+    from html import escape
+    try:
+        amount = fmt_money(float(str(it['amount']).replace(' ', '').replace(',', '.')))
+    except Exception:
+        amount = escape(str(it['amount']))
+    text = (
+        f"⚠️ <b>Нужно переснять чек</b>\n\n"
+        f"Расход: {escape(it['date'])} · {amount} · {escape(it['category'])}\n"
+    )
+    if it['comment']:
+        text += f"\n💬 {escape(it['comment'])}\n"
+    text += (
+        "\nОтправьте, пожалуйста, этот расход заново с новым чеком: ➕ Добавить расход. "
+        "Старая запись уже убрана из отчёта, дважды расход не посчитается."
+    )
+    return text
+
+
+async def send_returns(bot) -> str:
+    """Один проход: отправляет сотрудникам расходы, отмеченные «Вернуть на доработку»"""
+    gs = GoogleSheetsManager()
+    items = await asyncio.to_thread(gs.collect_returns)
+    if not items:
+        return "Нечего отправлять: нет строк с галочкой «Вернуть на доработку» (колонка L)."
+    sent, failed = {}, {}
+    now = datetime.now().strftime('%d.%m %H:%M')
+    for it in items:
+        if not it['chat_id']:
+            status = '⚠️ нет Telegram-ID: сотрудник должен один раз открыть бота (/start)'
+            failed[it['name']] = failed.get(it['name'], 0) + 1
+            await asyncio.to_thread(gs.set_return_status, it['ws'], it['row'], status)
+            continue
+        try:
+            await bot.send_message(chat_id=it['chat_id'], text=return_message(it), parse_mode=ParseMode.HTML)
+            sent[it['name']] = sent.get(it['name'], 0) + 1
+            await asyncio.to_thread(gs.set_return_status, it['ws'], it['row'], f'✅ Отправлено {now}', True)
+        except Exception as e:
+            logger.error(f"Возврат не отправлен: {e}")
+            failed[it['name']] = failed.get(it['name'], 0) + 1
+            await asyncio.to_thread(gs.set_return_status, it['ws'], it['row'], f'⚠️ не удалось отправить ({now})')
+    lines = ["📨 <b>Готово</b>"]
+    if sent:
+        lines.append("\nОтправлено:")
+        lines += [f"• {n} — {c}" for n, c in sent.items()]
+    if failed:
+        lines.append("\n⚠️ Не доставлено (подробности в колонке N):")
+        lines += [f"• {n} — {c}" for n, c in failed.items()]
+    return "\n".join(lines)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.to_thread(register_user, update)
     await update.message.reply_text(
         f"👋 Привет, {full_name(update.effective_user)}!\n\nВыберите действие:",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(update)
     )
     return MENU
 
@@ -568,6 +769,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await asyncio.to_thread(register_user, update)
 
     if query.data == "menu_add":
         context.user_data.clear()
@@ -599,8 +801,40 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MENU
 
+    elif query.data == "menu_checked":
+        if not is_admin(update):
+            return MENU
+        await query.edit_message_text("⏳ Смотрю таблицу...")
+        gs = GoogleSheetsManager()
+        items = await asyncio.to_thread(gs.collect_returns)
+        if not items:
+            await query.edit_message_text(
+                "Нечего отправлять: нет строк с галочкой «Вернуть на доработку» (колонка L).",
+                reply_markup=main_menu_keyboard(update))
+            return MENU
+        by_name = {}
+        for it in items:
+            by_name[it['name']] = by_name.get(it['name'], 0) + 1
+        lines = ["📨 <b>Будут отправлены уведомления:</b>\n"] + [f"• {n} — {c}" for n, c in by_name.items()]
+        lines.append("\nУ отправленных расходов старая строка закроется автоматически.")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Отправить", callback_data="menu_checked_send"),
+                InlineKeyboardButton("❌ Отмена", callback_data="back_menu"),
+            ]]))
+        return MENU
+
+    elif query.data == "menu_checked_send":
+        if not is_admin(update):
+            return MENU
+        await query.edit_message_text("⏳ Отправляю...")
+        text = await send_returns(context.bot)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(update))
+        return MENU
+
     elif query.data == "back_menu":
-        await query.edit_message_text("Выберите действие:", reply_markup=main_menu_keyboard())
+        await query.edit_message_text("Выберите действие:", reply_markup=main_menu_keyboard(update))
         return MENU
 
 
@@ -890,7 +1124,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if query.data == 'confirm_no':
         await query.edit_message_text("❌ Отменено.")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите действие:", reply_markup=main_menu_keyboard())
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите действие:", reply_markup=main_menu_keyboard(update))
         return MENU
 
     if query.data == 'confirm_edit':
@@ -944,7 +1178,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await query.edit_message_text("❌ Ошибка при сохранении. Попробуйте ещё раз.")
 
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите действие:", reply_markup=main_menu_keyboard())
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите действие:", reply_markup=main_menu_keyboard(update))
         return MENU
 
 
@@ -986,7 +1220,7 @@ async def edit_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gs = GoogleSheetsManager()
     b = gs.get_balance(full_name(update.effective_user))
-    await update.message.reply_text(format_balance(b), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(format_balance(b), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(update))
 
 
 async def myexpenses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -999,11 +1233,11 @@ async def myexpenses_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for e in expenses:
             lines.append(f"{e['status']} {e['date'][:10]} | {e['amount']} ₽ | {e['category']}")
         text = "\n".join(lines)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(update))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Отменено.", reply_markup=main_menu_keyboard())
+    await update.message.reply_text("❌ Отменено.", reply_markup=main_menu_keyboard(update))
     return MENU
 
 
@@ -1012,7 +1246,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 <b>Справка</b>\n\n/start — главное меню\n/balance — мой баланс\n"
         "/myexpenses — мои расходы\n/cancel — отменить\n\n"
         "<b>Направления:</b>\n🚜 СТ — Синий Трактор\n🎭 ФШ — Фиксишоу",
-        parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
+        parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(update)
     )
 
 
