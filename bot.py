@@ -5,6 +5,7 @@ Expense Tracker Bot для Telegram
 """
 
 import os
+import re
 import asyncio
 import logging
 import json
@@ -109,6 +110,27 @@ def parse_date(text: str) -> Optional[tuple]:
             return None
         return day, month
     except:
+        return None
+
+
+def parse_money(value) -> Optional[float]:
+    """Сумма из ячейки таблицы: число или текст вида '1 234,50 ₽' (с неразрывными пробелами и знаком рубля)"""
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = re.sub(r'[^0-9,.\-]', '', str(value or ''))
+    if not s or s in ('-', ',', '.'):
+        return None
+    if ',' in s and '.' in s:
+        # последний разделитель — десятичный, остальные — тысячные
+        if s.rfind(',') > s.rfind('.'):
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            s = s.replace(',', '')
+    else:
+        s = s.replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
         return None
 
 
@@ -501,7 +523,7 @@ class GoogleSheetsManager:
             for row in sheet.get_all_values()[1:]:
                 if len(row) >= 6 and row[3] == subproject and row[4] == category:
                     try:
-                        if float(str(row[2]).replace(' ', '').replace(',', '.')) == amount:
+                        if parse_money(row[2]) == amount:
                             return True
                     except:
                         pass
@@ -525,7 +547,9 @@ class GoogleSheetsManager:
                     if isinstance(val, (int, float)):
                         amount = float(val)
                     else:
-                        amount = float(str(val).replace(' ', '').replace(',', '.'))
+                        amount = parse_money(val)
+                        if amount is None:
+                            continue
                 except:
                     continue
 
@@ -570,7 +594,7 @@ class GoogleSheetsManager:
                 if len(row) > 7 and str(row[7]).upper() in ('TRUE', 'ИСТИНА', '1'):
                     continue  # закрыто
                 try:
-                    amount = float(str(row[2]).replace(' ', '').replace(',', '.'))
+                    amount = parse_money(row[2]) or 0.0
                 except:
                     amount = 0.0
                 accepted = len(row) > 6 and str(row[6]).upper() in ('TRUE', 'ИСТИНА', '1')
@@ -709,7 +733,7 @@ def register_user(update: Update):
 def return_message(it: Dict) -> str:
     from html import escape
     try:
-        amount = fmt_money(float(str(it['amount']).replace(' ', '').replace(',', '.')))
+        amount = fmt_money(parse_money(it['amount']) or 0.0)
     except Exception:
         amount = escape(str(it['amount']))
     text = (
